@@ -2,6 +2,9 @@
 # Builds both Portable Conective.exe and Single-File Conective-Setup.exe installer
 
 $ErrorActionPreference = "Stop"
+if ($PSScriptRoot) {
+    Set-Location (Split-Path -Parent $PSScriptRoot)
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "     Building Conective for Windows       " -ForegroundColor Cyan
@@ -20,6 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to build Conective.exe" }
 Write-Host "[3/4] Preparing embedded binaries and assets for installer..." -ForegroundColor Yellow
 Copy-Item "Conective.exe" -Destination "cmd\installer\Conective.exe" -Force
 Copy-Item "bin" -Destination "cmd\installer\bin" -Recurse -Force
+Remove-Item "cmd\installer\bin\conective.exe" -Force -ErrorAction SilentlyContinue
 Copy-Item "assets\GeoLite2-Country.mmdb" -Destination "cmd\installer\GeoLite2-Country.mmdb" -Force
 Copy-Item "assets\wintun.dll" -Destination "cmd\installer\wintun.dll" -Force
 

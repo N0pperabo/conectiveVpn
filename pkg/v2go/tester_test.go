@@ -66,3 +66,31 @@ func TestLiveTester_CleanIPAndPsiphonProbes(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertToXrayOutbound_SocksAndHTTP(t *testing.T) {
+	socksCfg := &models.Config{
+		Protocol: "socks",
+		Server:   "127.0.0.1",
+		Port:     1080,
+	}
+	outbound, err := ConvertToXrayOutbound(socksCfg)
+	if err != nil {
+		t.Fatalf("expected socks to convert cleanly, got: %v", err)
+	}
+	if outbound["protocol"] != "socks" {
+		t.Errorf("expected protocol 'socks', got: %v", outbound["protocol"])
+	}
+
+	httpCfg := &models.Config{
+		Protocol: "http",
+		Server:   "127.0.0.1",
+		Port:     8085,
+	}
+	outboundHttp, err := ConvertToXrayOutbound(httpCfg)
+	if err != nil {
+		t.Fatalf("expected http to convert cleanly, got: %v", err)
+	}
+	if outboundHttp["protocol"] != "http" {
+		t.Errorf("expected protocol 'http', got: %v", outboundHttp["protocol"])
+	}
+}

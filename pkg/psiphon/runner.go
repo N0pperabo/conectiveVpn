@@ -1,9 +1,11 @@
 package psiphon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -23,18 +25,21 @@ import (
 	"freenode/pkg/logger"
 )
 
-// Runner manages the lifecycle of the Psiphon / Aether circumvention engine
+// Runner manages the lifecycle of the Psiphon ShiroKhorshid circumvention engine
 type Runner struct {
-	mu           sync.Mutex
-	cmd          *exec.Cmd
-	running      bool
-	cleanIP      string
-	egressRegion string
-	socksPort    int
-	httpPort     int
-	connectedAt  time.Time
-	lastLatency  int
-	exitIP       string
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	running        bool
+	cleanIP        string
+	egressRegion   string
+	socksPort      int
+	httpPort       int
+	connectedAt    time.Time
+	lastLatency    int
+	exitIP         string
+	activeTunnels  int
+	candidateCount int
+	tunnelReadyCh  chan struct{}
 }
 
 // NewRunner creates a new Psiphon runner instance
@@ -90,11 +95,8 @@ func FindBinaries() (aetherPath, psiphonPath string, err error) {
 		}
 	}
 
-	if aetherPath == "" {
-		return "", "", fmt.Errorf("aether.exe not found in search paths")
-	}
-	if psiphonPath == "" {
-		return "", "", fmt.Errorf("psiphon-tunnel-core.exe not found in search paths")
+	if aetherPath == "" && psiphonPath == "" {
+		return "", "", fmt.Errorf("neither psiphon-tunnel-core.exe nor aether.exe found in search paths")
 	}
 
 	return aetherPath, psiphonPath, nil
@@ -188,7 +190,7 @@ func ShiroCdnFrontingConfig(cleanIP, sni string) ([]byte, error) {
 	return ShiroCdnFrontingConfigWithRegion(cleanIP, sni, "")
 }
 
-// Start launches Aether in Psiphon-only mode with the selected Clean CDN IP
+// Start launches Psiphon in default mode with the selected Clean CDN IP
 func (r *Runner) Start(cleanIP string, socksPort, httpPort int) error {
 	return r.StartWithRegion(cleanIP, "", "", "", socksPort, httpPort)
 }
@@ -226,11 +228,6 @@ func getSafePsiphonDir(egressRegion string) string {
 	baseDir := filepath.Join(appData, "Conective", "psiphon")
 	_ = os.MkdirAll(baseDir, 0755)
 
-	// Use ONE unified shared data directory for Psiphon.
-	// Psiphon maintains learned tactics, tested server ratings, and connection state
-	// in its internal database (psiphon.boltdb and remote_server_list).
-	// Splitting directories per region created cold-start empty profiles that fail in Iran,
-	// whereas sharing the data directory allows all regions to instantly leverage learned tactics.
 	targetDir := filepath.Join(baseDir, "data")
 	_ = os.MkdirAll(targetDir, 0755)
 
@@ -239,87 +236,22 @@ func getSafePsiphonDir(egressRegion string) string {
 	dataStoreDir := filepath.Join(coreDir, "datastore")
 	_ = os.MkdirAll(dataStoreDir, 0755)
 
-	// Migrate / seed the best available datastore into targetDir if target datastore is missing or small
-	targetBolt := filepath.Join(dataStoreDir, "psiphon.boltdb")
-	var targetSize int64
-	if info, err := os.Stat(targetBolt); err == nil {
-		targetSize = info.Size()
-	}
-
-	boltCandidates := []string{
-		filepath.Join(baseDir, "profile_auto", "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb"),
-		filepath.Join(baseDir, "profile_de", "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb"),
-		filepath.Join(baseDir, "profile_gb", "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb"),
-		filepath.Join(baseDir, "profile_us", "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb"),
-		filepath.Join(baseDir, "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb"),
-	}
-	for _, cand := range boltCandidates {
-		if cInfo, cErr := os.Stat(cand); cErr == nil && cInfo.Size() > targetSize {
-			if data, errRead := os.ReadFile(cand); errRead == nil && len(data) > 0 {
-				_ = os.WriteFile(targetBolt, data, 0644)
-				targetSize = cInfo.Size()
-				break
-			}
-		}
-	}
-
-	// Seed remote_server_list if it doesn't exist yet or is small in targetDir
-	targetServerList := filepath.Join(coreDir, "remote_server_list")
-	var sListSize int64
-	if sInfo, err := os.Stat(targetServerList); err == nil {
-		sListSize = sInfo.Size()
-	}
-	serverCandidates := []string{
-		filepath.Join(baseDir, "profile_auto", "ca.psiphon.PsiphonTunnel.tunnel-core", "remote_server_list"),
-		filepath.Join(baseDir, "profile_us", "ca.psiphon.PsiphonTunnel.tunnel-core", "remote_server_list"),
-		filepath.Join(baseDir, "profile_de", "ca.psiphon.PsiphonTunnel.tunnel-core", "remote_server_list"),
-		filepath.Join(baseDir, "ca.psiphon.PsiphonTunnel.tunnel-core", "remote_server_list"),
-	}
-	for _, cand := range serverCandidates {
-		if cInfo, cErr := os.Stat(cand); cErr == nil && cInfo.Size() > sListSize {
-			if data, errRead := os.ReadFile(cand); errRead == nil && len(data) > 0 {
-				_ = os.WriteFile(targetServerList, data, 0644)
-				sListSize = cInfo.Size()
-				break
-			}
-		}
-	}
-
-	// Seed osl (obfuscated server list) if present in profile_auto
-	targetOSL := filepath.Join(coreDir, "osl")
-	if _, err := os.Stat(targetOSL); os.IsNotExist(err) {
-		for _, candFolder := range []string{"profile_auto", "profile_us", "profile_de"} {
-			candOSL := filepath.Join(baseDir, candFolder, "ca.psiphon.PsiphonTunnel.tunnel-core", "osl")
-			if data, errRead := os.ReadFile(candOSL); errRead == nil && len(data) > 0 {
-				_ = os.WriteFile(targetOSL, data, 0644)
-				break
-			}
-		}
-	}
-
-	// Clean up any stale lock files or lingering configs
+	// Clean up stale locks and temporary files
 	_ = os.Remove(filepath.Join(targetDir, "psiphon.boltdb.lock"))
 	_ = os.Remove(filepath.Join(coreDir, "psiphon.boltdb.lock"))
 	_ = os.Remove(filepath.Join(dataStoreDir, "psiphon.boltdb.lock"))
 	_ = os.Remove(filepath.Join(coreDir, "remote_server_list.part"))
-	_ = os.Remove(filepath.Join(targetDir, "shiro_config.json"))
-	_ = os.Remove(filepath.Join(targetDir, "aether-psiphon.json"))
-	_ = os.Remove(filepath.Join(baseDir, "aether-psiphon.json"))
-	_ = os.Remove(filepath.Join(baseDir, "shiro_config.json"))
 
 	return targetDir
 }
 
-// StartWithSNI launches Aether in Psiphon-only mode with the selected Clean CDN IP, custom SNI and CDN set
+// StartWithSNI launches Psiphon mode with the selected Clean CDN IP, custom SNI and CDN set
 func (r *Runner) StartWithSNI(cleanIP, sni, cdnSet string, socksPort, httpPort int) error {
 	return r.StartWithRegion(cleanIP, sni, cdnSet, "", socksPort, httpPort)
 }
 
 // BuildArgs constructs the command line arguments for launching Aether in Psiphon mode.
-// For direct connections (cleanIP empty, "auto", or "direct"), --psiphon-mode direct is NOT passed,
-// leaving Aether to run in Auto shape using its built-in tactics.
-// For CDN fronting connections, --psiphon-mode cdn is passed along with fronting configurations.
-// If egressRegion is empty, "AUTO", or "ANY", --psiphon-region is omitted to leave egress open to any available server.
+// Preserved for backward-compatibility and tests.
 func BuildArgs(psiphonBin, psiphonDir, cleanIP, sni, cdnSet, egressRegion string, socksPort, httpPort int) []string {
 	if socksPort <= 0 {
 		socksPort = 10808
@@ -376,11 +308,12 @@ func BuildArgs(psiphonBin, psiphonDir, cleanIP, sni, cdnSet, egressRegion string
 	return args
 }
 
-// StartWithRegion launches Aether in Psiphon-only mode with the selected Clean CDN IP, custom SNI, CDN set and egress region
+// StartWithRegion launches the ShiroKhorshid Psiphon engine with the selected Clean CDN IP,
+// custom SNI, CDN set and egress region.
+// It directly invokes psiphon-tunnel-core with full ShiroKhorshid CDN fronting specs and
+// real-time notice streaming, falling back to aether if necessary.
 func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, socksPort, httpPort int) error {
 	r.mu.Lock()
-
-	// Stop any existing session
 	r.stopLocked()
 
 	aetherBin, psiphonBin, err := FindBinaries()
@@ -393,7 +326,7 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 		socksPort = 10808
 	}
 	if httpPort <= 0 {
-		httpPort = 10809
+		httpPort = socksPort + 1
 	}
 
 	r.socksPort = socksPort
@@ -407,53 +340,108 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 	psiphonDir := getSafePsiphonDir(r.egressRegion)
 	isDirect := r.cleanIP == "" || r.cleanIP == "auto" || r.cleanIP == "direct"
 
-	args := BuildArgs(psiphonBin, psiphonDir, r.cleanIP, sni, cdnSet, r.egressRegion, socksPort, httpPort)
+	if !isDirect && sni == "" {
+		detSNI, _ := detectIPDefaults(r.cleanIP)
+		sni = detSNI
+	}
+
+	// 1. Ensure server_list.dat is seeded in target data directory
+	serverListPath, errSList := EnsurePsiphonServerList(psiphonDir)
+	if errSList != nil {
+		logger.Warn("psiphon", "Warning seeding server list: %v", errSList)
+	}
+
+	// 2. Generate ShiroKhorshid Psiphon JSON configuration
+	edges := ParseCdnEdges(r.cleanIP)
+	if isDirect {
+		edges = nil
+	}
+
+	shiroCfgBytes, errCfg := BuildShiroKhorshidConfig(ShiroConfigOptions{
+		SocksPort:      socksPort,
+		HTTPPort:       httpPort,
+		DataDir:        psiphonDir,
+		EgressRegion:   r.egressRegion,
+		TunnelPoolSize: 1,
+		CdnFronting:    !isDirect && len(edges) > 0,
+		CdnEdges:       edges,
+		SNI:            sni,
+	})
+	if errCfg != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("generating ShiroKhorshid config: %w", errCfg)
+	}
+
+	configFilePath := filepath.Join(psiphonDir, "config.json")
+	if err := os.WriteFile(configFilePath, shiroCfgBytes, 0644); err != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("writing psiphon config file: %w", err)
+	}
 
 	ensurePortsReleased(socksPort, httpPort)
 
-	cmd := exec.Command(aetherBin, args...)
+	r.tunnelReadyCh = make(chan struct{})
+	var cmd *exec.Cmd
+
+	// Prefer direct native psiphon-tunnel-core with full ShiroKhorshid notice streaming
+	if psiphonBin != "" {
+		args := []string{
+			"-config", configFilePath,
+			"-dataRootDirectory", psiphonDir,
+			"-formatNotices",
+		}
+		if serverListPath != "" {
+			args = append(args, "-serverList", serverListPath)
+		}
+
+		cmd = exec.Command(psiphonBin, args...)
+		cmd.Dir = psiphonDir
+		logger.Info("psiphon", "Launching native ShiroKhorshid Psiphon engine: %s (socks=%d, http=%d)", psiphonBin, socksPort, httpPort)
+	} else {
+		// Fallback to aether wrapping psiphon
+		args := BuildArgs(psiphonBin, psiphonDir, r.cleanIP, sni, cdnSet, r.egressRegion, socksPort, httpPort)
+		args = append(args, "--psiphon-config", configFilePath)
+		if serverListPath != "" {
+			args = append(args, "--psiphon-server-entries", serverListPath)
+		}
+		cmd = exec.Command(aetherBin, args...)
+		logger.Info("psiphon", "Launching Aether-wrapped Psiphon engine: %s", aetherBin)
+	}
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
-	cmd.Stdout = logger.Writer("psiphon", "info")
+
+	stdoutPipe, pipeErr := cmd.StdoutPipe()
+	if pipeErr != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("creating stdout pipe: %w", pipeErr)
+	}
 	cmd.Stderr = logger.Writer("psiphon", "warn")
 
+	regLog := r.egressRegion
+	if regLog == "" {
+		regLog = "auto (any available)"
+	}
 	if isDirect {
-		regLog := r.egressRegion
-		if regLog == "" {
-			regLog = "auto (any available)"
-		}
 		logger.Info("psiphon", "Starting direct Psiphon engine: region=%s, socks=%d, http=%d", regLog, socksPort, httpPort)
 	} else {
-		regLog := r.egressRegion
-		if regLog == "" {
-			regLog = "auto (any available)"
-		}
-		logger.Info("psiphon", "Starting engine: cleanIP=%s, sni=%s, cdnSet=%s, region=%s, socks=%d, http=%d", r.cleanIP, sni, cdnSet, regLog, socksPort, httpPort)
+		logger.Info("psiphon", "Starting ShiroKhorshid CDN engine: cleanIP=%s, sni=%s, region=%s, socks=%d, http=%d", r.cleanIP, sni, regLog, socksPort, httpPort)
 	}
-	log.Printf("[Psiphon] Starting engine: %s %s", aetherBin, strings.Join(args, " "))
+
 	if err := cmd.Start(); err != nil {
 		r.mu.Unlock()
-		return fmt.Errorf("starting aether psiphon process: %w", err)
+		return fmt.Errorf("starting psiphon process: %w", err)
 	}
 
 	r.cmd = cmd
 	r.running = true
 	r.connectedAt = time.Now()
 
-	// Monitor process exit in background
-	go func(c *exec.Cmd) {
-		_ = c.Wait()
-		r.mu.Lock()
-		if r.cmd == c {
-			r.running = false
-			r.cmd = nil
-		}
-		r.mu.Unlock()
-	}(cmd)
+	// Stream notices and monitor tunnel state in background
+	go r.streamNotices(stdoutPipe, cmd)
 
-	// Release mutex so we do not block other operations or deadlock in probe loops
 	r.mu.Unlock()
 
 	// Step 1: Wait up to 15 seconds for local ports to bind
@@ -465,13 +453,13 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 			_ = r.Stop()
 			return fmt.Errorf("psiphon process terminated before ports bound")
 		}
-		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 400*time.Millisecond)
+		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 300*time.Millisecond)
 		if dialErr == nil {
 			_ = conn.Close()
 			portsBound = true
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	if !portsBound {
@@ -480,18 +468,12 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 		return fmt.Errorf("psiphon tunnel failed to bind ports %d/%d within 15s", socksPort, httpPort)
 	}
 
-	regLog := r.egressRegion
-	if regLog == "" {
-		regLog = "auto"
-	}
-	if isDirect {
-		logger.Info("psiphon", "Local proxy ports bound (SOCKS5:%d, HTTP:%d). Negotiating direct Psiphon tunnel (region: %s)...", socksPort, httpPort, regLog)
-	} else {
-		logger.Info("psiphon", "Local proxy ports bound (SOCKS5:%d, HTTP:%d). Negotiating CDN tunnel with %s (region: %s)...", socksPort, httpPort, r.cleanIP, regLog)
-	}
+	logger.Info("psiphon", "Local proxy ports bound (SOCKS5:%d, HTTP:%d). Waiting for tunnel handshake...", socksPort, httpPort)
 
-	// Step 2: Probe through Psiphon's local HTTP proxy until tunnel is active and passing traffic
-	// Meek CDN handshake takes ~10-25s to establish the encrypted OSSH tunnel
+	// Step 2: Wait for tunnel establishment (signaled by Notice "Tunnels" count > 0 or verified via probe)
+	tunnelReady := false
+	tunnelDeadline := time.Now().Add(45 * time.Second)
+
 	tunnelClient := &http.Client{
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(&url.URL{
@@ -500,20 +482,33 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 			}),
 			DisableKeepAlives: true,
 		},
-		Timeout: 3 * time.Second,
+		Timeout: 2500 * time.Millisecond,
 	}
 
-	tunnelDeadline := time.Now().Add(90 * time.Second)
-	tunnelReady := false
-	attempt := 0
-
 	for time.Now().Before(tunnelDeadline) {
-		attempt++
 		if !r.IsRunning() {
 			_ = r.Stop()
 			return fmt.Errorf("psiphon process terminated unexpectedly during tunnel establishment")
 		}
 
+		// Check if notice streamer already detected active tunnels
+		r.mu.Lock()
+		tCount := r.activeTunnels
+		r.mu.Unlock()
+
+		if tCount > 0 {
+			tunnelReady = true
+			// Non-blocking background probe to log initial connectivity
+			go func() {
+				resp, err := tunnelClient.Get("http://cp.cloudflare.com/generate_204")
+				if err == nil {
+					_ = resp.Body.Close()
+				}
+			}()
+			break
+		}
+
+		// Periodic probe attempt before Tunnels notice
 		resp, err := tunnelClient.Get("http://cp.cloudflare.com/generate_204")
 		if err == nil {
 			_ = resp.Body.Close()
@@ -523,31 +518,68 @@ func (r *Runner) StartWithRegion(cleanIP, sni, cdnSet, egressRegion string, sock
 			}
 		}
 
-		if attempt%3 == 0 {
-			if isDirect {
-				logger.Info("psiphon", "Direct Psiphon handshake in progress (waiting for tunnel to establish, %ds elapsed)...", attempt)
-			} else {
-				logger.Info("psiphon", "CDN fronting handshake in progress (waiting for tunnel to establish, %ds elapsed)...", attempt)
-			}
-		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(600 * time.Millisecond)
 	}
 
 	if !tunnelReady {
+		_ = r.Stop()
 		if isDirect {
-			logger.Error("psiphon", "Psiphon direct tunnel handshake timed out after 90s (no active tunnel established)")
-			_ = r.Stop()
-			return fmt.Errorf("direct Psiphon tunnel failed to establish connection within 90s")
-		} else {
-			logger.Error("psiphon", "Psiphon tunnel handshake timed out after 90s (no active tunnel established)")
-			_ = r.Stop()
-			return fmt.Errorf("psiphon tunnel failed to establish connection with CDN node %s within 90s", r.cleanIP)
+			return fmt.Errorf("direct Psiphon tunnel failed to establish active tunnel within 45s")
+		}
+		return fmt.Errorf("psiphon tunnel failed to establish connection with CDN node %s within 45s", r.cleanIP)
+	}
+
+	logger.Info("psiphon", "ShiroKhorshid tunnel successfully active on SOCKS5 127.0.0.1:%d and HTTP 127.0.0.1:%d", socksPort, httpPort)
+	log.Printf("[Psiphon] ShiroKhorshid tunnel active on SOCKS5 127.0.0.1:%d and HTTP 127.0.0.1:%d", socksPort, httpPort)
+	return nil
+}
+
+// streamNotices reads and logs Psiphon notices from core output
+func (r *Runner) streamNotices(reader io.Reader, cmd *exec.Cmd) {
+	scanner := bufio.NewScanner(reader)
+	// Support long notice lines (e.g. CandidateServers or diagnostics)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		notice := ParseNotice(line)
+		if notice != nil {
+			if logLine := FormatNoticeLog(notice); logLine != "" {
+				logger.Info("psiphon", "%s", logLine)
+			}
+
+			r.mu.Lock()
+			switch notice.NoticeType {
+			case "CandidateServers":
+				if c, ok := notice.Data["count"].(float64); ok {
+					r.candidateCount = int(c)
+				}
+			case "Tunnels":
+				if c, ok := notice.Data["count"].(float64); ok {
+					r.activeTunnels = int(c)
+					if r.activeTunnels > 0 && r.tunnelReadyCh != nil {
+						select {
+						case <-r.tunnelReadyCh:
+						default:
+							close(r.tunnelReadyCh)
+						}
+					}
+				}
+			}
+			r.mu.Unlock()
+		} else if strings.TrimSpace(line) != "" {
+			logger.Info("psiphon", "%s", line)
 		}
 	}
 
-	logger.Info("psiphon", "Tunnel successfully active and verified on SOCKS5 127.0.0.1:%d and HTTP 127.0.0.1:%d", socksPort, httpPort)
-	log.Printf("[Psiphon] Tunnel active and verified on SOCKS5 127.0.0.1:%d and HTTP 127.0.0.1:%d", socksPort, httpPort)
-	return nil
+	_ = cmd.Wait()
+	r.mu.Lock()
+	if r.cmd == cmd {
+		r.running = false
+		r.cmd = nil
+	}
+	r.mu.Unlock()
 }
 
 // Stop terminates the Psiphon/Aether process and kills any lingering instances
@@ -572,22 +604,28 @@ func (r *Runner) stopLocked() {
 	socksPort := r.socksPort
 	httpPort := r.httpPort
 
+	if r.tunnelReadyCh != nil {
+		select {
+		case <-r.tunnelReadyCh:
+		default:
+			close(r.tunnelReadyCh)
+		}
+		r.tunnelReadyCh = nil
+	}
+
 	if r.cmd != nil && r.cmd.Process != nil {
 		pid := r.cmd.Process.Pid
 		log.Printf("[Psiphon] Stopping engine (PID %d)...", pid)
 
-		// Terminate process tree cleanly without flashing console window
 		_ = silentCmd("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 		_ = r.cmd.Process.Kill()
 		r.cmd = nil
 	}
 
 	if wasRunning {
-		// Cleanup any orphan engine processes silently
 		_ = silentCmd("taskkill", "/F", "/IM", "aether.exe").Run()
 		_ = silentCmd("taskkill", "/F", "/IM", "psiphon-tunnel-core.exe").Run()
 
-		// Wait for sockets to be completely released so ports can be bound fresh
 		if socksPort > 0 && httpPort > 0 {
 			ensurePortsReleased(socksPort, httpPort)
 		}
@@ -609,6 +647,8 @@ func (r *Runner) stopLocked() {
 	r.egressRegion = ""
 	r.lastLatency = 0
 	r.exitIP = ""
+	r.activeTunnels = 0
+	r.candidateCount = 0
 
 	runtime.GC()
 	debug.FreeOSMemory()
@@ -627,6 +667,20 @@ func (r *Runner) GetEgressRegion() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.egressRegion
+}
+
+// GetActiveTunnels returns the number of active tunnels reported by core notices
+func (r *Runner) GetActiveTunnels() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.activeTunnels
+}
+
+// GetCandidateCount returns the number of candidate servers loaded by core
+func (r *Runner) GetCandidateCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.candidateCount
 }
 
 // VerifyTunnel performs a real outbound HTTP probe through the local SOCKS/HTTP proxy
@@ -667,7 +721,6 @@ func (r *Runner) probeOnce() (int, string, error) {
 		return -1, "", fmt.Errorf("no active proxy ports")
 	}
 
-	// Try via HTTP proxy first, fallback to SOCKS5
 	var proxyURL *url.URL
 	if hp > 0 {
 		proxyURL, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", hp))
@@ -691,11 +744,9 @@ func (r *Runner) probeOnce() (int, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Test against Cloudflare generate_204 or Cloudflare trace
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://www.cloudflare.com/cdn-cgi/trace", nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		// Fallback to google.com 204
 		req2, _ := http.NewRequestWithContext(ctx, "GET", "http://cp.cloudflare.com/generate_204", nil)
 		resp2, err2 := client.Do(req2)
 		if err2 != nil {
@@ -709,7 +760,6 @@ func (r *Runner) probeOnce() (int, string, error) {
 
 	latency := int(time.Since(start).Milliseconds())
 
-	// Read trace output for exit IP
 	buf := make([]byte, 2048)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])

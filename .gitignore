@@ -2,9 +2,20 @@
 *.exe
 !bin/aether.exe
 !bin/psiphon-tunnel-core.exe
+!bin/sni-spoofing/sni-spoofing.exe
 
 *.dll
 !assets/wintun.dll
+!bin/sni-spoofing/WinDivert64.dll
+!bin/sni-spoofing/_internal/**/*.dll
+!bin/sni-spoofing/_internal/**/*.pyd
+
+# Python artifacts
+**/__pycache__/**
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
 
 # Databases and temporary logs
 *.db

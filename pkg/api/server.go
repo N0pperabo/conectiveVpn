@@ -19,10 +19,12 @@ import (
 	"freenode/pkg/gaming"
 	"freenode/pkg/lan"
 	"freenode/pkg/logger"
+	"freenode/pkg/mhr"
 	"freenode/pkg/models"
 	"freenode/pkg/procutil"
 	"freenode/pkg/proxy"
 	"freenode/pkg/scheduler"
+	"freenode/pkg/snispoof"
 	"freenode/pkg/subscription"
 	"freenode/pkg/tun"
 	"freenode/pkg/updater"
@@ -31,15 +33,17 @@ import (
 )
 
 type Server struct {
-	db         *database.DB
-	engine     *v2go.Engine
-	runner     *xray.Runner
-	proxyMgr   *proxy.Manager
-	scheduler  *scheduler.Controller
-	subMgr     *subscription.Manager
-	cleanIPMgr *cleanip.Manager
-	updater    *updater.Updater
-	mux        *http.ServeMux
+	db          *database.DB
+	engine      *v2go.Engine
+	runner      *xray.Runner
+	proxyMgr    *proxy.Manager
+	scheduler   *scheduler.Controller
+	subMgr      *subscription.Manager
+	cleanIPMgr  *cleanip.Manager
+	updater     *updater.Updater
+	mhrMgr      *mhr.Manager
+	sniSpoofMgr *snispoof.Manager
+	mux         *http.ServeMux
 }
 
 func NewServer(
@@ -58,19 +62,59 @@ func NewServer(
 		cleanMgr.SetGeoResolver(geo)
 	}
 
+	mhrManager := mhr.NewManager(db, proxyMgr, "")
+	sniManager := snispoof.NewManager("")
+	if db != nil {
+		listenPort, _ := strconv.Atoi(db.GetSetting("sni_spoof_listen_port", "40443"))
+		connectPort, _ := strconv.Atoi(db.GetSetting("sni_spoof_connect_port", "443"))
+		sniManager.SetConfig(snispoof.Config{
+			Enabled:     db.GetSetting("sni_spoof_enabled", "false") == "true",
+			Engine:      db.GetSetting("sni_spoof_engine", "auto"),
+			ListenHost:  db.GetSetting("sni_spoof_listen_host", "127.0.0.1"),
+			ListenPort:  listenPort,
+			ConnectIP:   db.GetSetting("sni_spoof_connect_ip", ""),
+			ConnectPort: connectPort,
+			FakeSNI:     db.GetSetting("sni_spoof_fake_sni", "auth.vercel.com"),
+		})
+	}
+	if runner != nil {
+		runner.SetSNISpoofManager(sniManager)
+	}
+
 	s := &Server{
-		db:         db,
-		engine:     engine,
-		runner:     runner,
-		proxyMgr:   proxyMgr,
-		scheduler:  sched,
-		subMgr:     subscription.NewManager(db),
-		cleanIPMgr: cleanMgr,
-		updater:    updater.NewUpdater(db, updater.CurrentVersion),
-		mux:        http.NewServeMux(),
+		db:          db,
+		engine:      engine,
+		runner:      runner,
+		proxyMgr:    proxyMgr,
+		scheduler:   sched,
+		subMgr:      subscription.NewManager(db),
+		cleanIPMgr:  cleanMgr,
+		updater:     updater.NewUpdater(db, updater.CurrentVersion),
+		mhrMgr:      mhrManager,
+		sniSpoofMgr: sniManager,
+		mux:         http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
+}
+
+func (s *Server) SetSNISpoofManager(m *snispoof.Manager) {
+	s.sniSpoofMgr = m
+	if s.runner != nil {
+		s.runner.SetSNISpoofManager(m)
+	}
+}
+
+func (s *Server) SNISpoofManager() *snispoof.Manager {
+	return s.sniSpoofMgr
+}
+
+func (s *Server) SetMHRManager(m *mhr.Manager) {
+	s.mhrMgr = m
+}
+
+func (s *Server) MHRManager() *mhr.Manager {
+	return s.mhrMgr
 }
 
 func (s *Server) Handler() http.Handler {
@@ -144,6 +188,25 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/tools/clean-ip/connect", s.handleCleanIPConnect)
 	s.mux.HandleFunc("/api/tools/clean-ip/save", s.handleCleanIPSave)
 	s.mux.HandleFunc("/api/tools/clean-ip/save-all", s.handleCleanIPSaveAll)
+
+	// MHR (Master HTTP Relay)
+	s.mux.HandleFunc("/api/mhr/config", s.handleMHRConfig)
+	s.mux.HandleFunc("/api/mhr/start", s.handleMHRStart)
+	s.mux.HandleFunc("/api/mhr/stop", s.handleMHRStop)
+	s.mux.HandleFunc("/api/mhr/status", s.handleMHRStatus)
+
+	// SNI Spoofing (DPI Bypass)
+	s.mux.HandleFunc("/api/snispoof/status", s.handleSniSpoofStatus)
+	s.mux.HandleFunc("/api/snispoof/settings", s.handleSniSpoofSettings)
+	s.mux.HandleFunc("/api/snispoof/toggle", s.handleSniSpoofToggle)
+	s.mux.HandleFunc("/api/snispoof/start", s.handleSniSpoofStart)
+	s.mux.HandleFunc("/api/snispoof/stop", s.handleSniSpoofStop)
+	s.mux.HandleFunc("/api/mhr/test", s.handleMHRTest)
+	s.mux.HandleFunc("/api/mhr/scan-google-ip", s.handleMHRScanGoogleIP)
+	s.mux.HandleFunc("/api/mhr/system-proxy", s.handleMHRSystemProxy)
+	s.mux.HandleFunc("/api/mhr/scripts", s.handleMHRScripts)
+	s.mux.HandleFunc("/api/mhr/install-ca", s.handleMHRInstallCA)
+	s.mux.HandleFunc("/api/mhr/uninstall-ca", s.handleMHRUninstallCA)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -164,10 +227,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	scanProgress := s.engine.GetProgress()
 
+	var mhrStatus any
+	if s.mhrMgr != nil {
+		mhrStatus = s.mhrMgr.GetStatus()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"connection": connStatus,
 		"scan":       scanProgress,
 		"stats":      stats,
+		"mhr":        mhrStatus,
 	})
 }
 
@@ -486,6 +555,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If this node is the MHR local relay node and MHR is not running, ensure it is started
+	if strings.HasPrefix(node.Identity, "mhr-local-") && s.mhrMgr != nil {
+		if !s.mhrMgr.IsRunning() {
+			logger.Info("api", "Node is MHR Local Relay but MHR is not running; starting MHR relay...")
+			if err := s.mhrMgr.Start(); err != nil {
+				logger.Error("api", "Failed auto-starting MHR relay: %v", err)
+				writeErr(w, http.StatusInternalServerError, fmt.Sprintf("Failed to start MHR relay: %v", err))
+				return
+			}
+		}
+	}
+
 	// Connect internal Xray
 	if err := s.runner.Connect(node); err != nil {
 		logger.Error("api", "Connect failed for node ID %d ('%s'): %v", id, node.Name, err)
@@ -496,11 +577,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	logger.Info("api", "Successfully connected to node '%s' (ID %d)", node.Name, id)
 
 	// Enable Windows system proxy if enabled in settings or for Psiphon / CDN IP nodes
-	sysProxyEnabled := s.db.GetSetting("system_proxy", "true") == "true" || node.Protocol == "psiphon" || node.IsCDNIP()
-	if sysProxyEnabled && s.proxyMgr != nil {
-		status := s.runner.GetStatus()
-		_ = s.proxyMgr.Enable(status.HTTPPort)
-	}
+	s.updateSystemProxy()
 
 	_, _ = s.db.RecordConnectionStart(node.ID, node.Server, node.Protocol)
 
@@ -737,6 +814,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		startWithWindows := s.db.GetSetting("start_with_windows", "false") == "true" || autostart.IsEnabled()
 		minimizeToTray := s.db.GetSetting("minimize_to_tray", "true") == "true"
 
+		sniEnabled := s.db.GetSetting("sni_spoof_enabled", "false") == "true"
+		sniEngine := s.db.GetSetting("sni_spoof_engine", "auto")
+		sniListenHost := s.db.GetSetting("sni_spoof_listen_host", "127.0.0.1")
+		sniListenPort, _ := strconv.Atoi(s.db.GetSetting("sni_spoof_listen_port", "40443"))
+		if sniListenPort <= 0 {
+			sniListenPort = 40443
+		}
+		sniConnectIP := s.db.GetSetting("sni_spoof_connect_ip", "")
+		sniConnectPort, _ := strconv.Atoi(s.db.GetSetting("sni_spoof_connect_port", "443"))
+		if sniConnectPort <= 0 {
+			sniConnectPort = 443
+		}
+		sniFakeSNI := s.db.GetSetting("sni_spoof_fake_sni", "auth.vercel.com")
+
 		settings := models.Settings{
 			TestConcurrency:   concurrency,
 			TestTimeoutSec:    timeout,
@@ -764,6 +855,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			ProxyApps:         proxyApps,
 			BlockDomains:      blockDomains,
 			UpdateRepo:        updateRepo,
+
+			SniSpoofEnabled:     sniEnabled,
+			SniSpoofEngine:      sniEngine,
+			SniSpoofListenHost:  sniListenHost,
+			SniSpoofListenPort:  sniListenPort,
+			SniSpoofConnectIP:   sniConnectIP,
+			SniSpoofConnectPort: sniConnectPort,
+			SniSpoofFakeSNI:     sniFakeSNI,
 		}
 		writeJSON(w, http.StatusOK, settings)
 		return
@@ -895,16 +994,60 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// If connected, seamlessly reload runner with new routing rules
-		if _, ok := raw["routing_mode"]; ok {
-			if s.runner != nil && s.runner.IsRunning() {
-				activeNode := s.runner.GetActiveNode()
-				if activeNode != nil {
-					go func(n *models.Config) {
-						_ = s.runner.Connect(n)
-					}(activeNode)
-				}
+		routingChanged := false
+		for _, k := range []string{"routing_mode", "direct_domains", "proxy_domains", "direct_apps", "proxy_apps", "block_domains"} {
+			if _, ok := raw[k]; ok {
+				routingChanged = true
+				break
 			}
 		}
+		if routingChanged && s.runner != nil && s.runner.IsRunning() {
+			activeNode := s.runner.GetActiveNode()
+			if activeNode != nil {
+				go func(n *models.Config) {
+					_ = s.runner.Connect(n)
+				}(activeNode)
+			}
+		}
+
+		// SNI Spoofing Settings
+		if _, ok := raw["sni_spoof_enabled"]; ok {
+			_ = s.db.SetSetting("sni_spoof_enabled", strconv.FormatBool(set.SniSpoofEnabled))
+		}
+		if _, ok := raw["sni_spoof_engine"]; ok && set.SniSpoofEngine != "" {
+			_ = s.db.SetSetting("sni_spoof_engine", set.SniSpoofEngine)
+		}
+		if _, ok := raw["sni_spoof_listen_host"]; ok && set.SniSpoofListenHost != "" {
+			_ = s.db.SetSetting("sni_spoof_listen_host", set.SniSpoofListenHost)
+		}
+		if _, ok := raw["sni_spoof_listen_port"]; ok && set.SniSpoofListenPort > 0 {
+			_ = s.db.SetSetting("sni_spoof_listen_port", strconv.Itoa(set.SniSpoofListenPort))
+		}
+		if _, ok := raw["sni_spoof_connect_ip"]; ok {
+			_ = s.db.SetSetting("sni_spoof_connect_ip", set.SniSpoofConnectIP)
+		}
+		if _, ok := raw["sni_spoof_connect_port"]; ok && set.SniSpoofConnectPort > 0 {
+			_ = s.db.SetSetting("sni_spoof_connect_port", strconv.Itoa(set.SniSpoofConnectPort))
+		}
+		if _, ok := raw["sni_spoof_fake_sni"]; ok && set.SniSpoofFakeSNI != "" {
+			_ = s.db.SetSetting("sni_spoof_fake_sni", set.SniSpoofFakeSNI)
+		}
+
+		if s.sniSpoofMgr != nil {
+			listenPort, _ := strconv.Atoi(s.db.GetSetting("sni_spoof_listen_port", "40443"))
+			connectPort, _ := strconv.Atoi(s.db.GetSetting("sni_spoof_connect_port", "443"))
+			s.sniSpoofMgr.SetConfig(snispoof.Config{
+				Enabled:     s.db.GetSetting("sni_spoof_enabled", "false") == "true",
+				Engine:      s.db.GetSetting("sni_spoof_engine", "auto"),
+				ListenHost:  s.db.GetSetting("sni_spoof_listen_host", "127.0.0.1"),
+				ListenPort:  listenPort,
+				ConnectIP:   s.db.GetSetting("sni_spoof_connect_ip", ""),
+				ConnectPort: connectPort,
+				FakeSNI:     s.db.GetSetting("sni_spoof_fake_sni", "auth.vercel.com"),
+			})
+		}
+
+		s.updateSystemProxy()
 
 		writeJSON(w, http.StatusOK, map[string]string{"message": "settings saved"})
 		return
@@ -1272,6 +1415,7 @@ func (s *Server) handleCleanIPStart(w http.ResponseWriter, r *http.Request) {
 		CustomCIDRs []string `json:"custom_cidrs"`
 		Port        int      `json:"port"`
 		CDNTarget   string   `json:"cdn_target"`
+		Country     string   `json:"country"`
 	}
 
 	if r.Body != nil {
@@ -1298,6 +1442,7 @@ func (s *Server) handleCleanIPStart(w http.ResponseWriter, r *http.Request) {
 		CustomCIDRs: req.CustomCIDRs,
 		Port:        req.Port,
 		CDNTarget:   req.CDNTarget,
+		Country:     req.Country,
 	}
 
 	if err := s.cleanIPMgr.StartScan(opts); err != nil {
@@ -1403,20 +1548,8 @@ func (s *Server) handleCleanIPConnect(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.db.UpsertConfig(cleanNode)
 	}
 
-	// Always enable Windows system proxy if enabled in settings or for Psiphon / CDN IP nodes,
-	// even when TUN mode is active. This ensures 100% of browsers (Chrome/Edge/Firefox)
-	// immediately route through the proxy and prevents DNS/IPv6 leakage.
-	sysProxyEnabled := s.db.GetSetting("system_proxy", "true") == "true" || cleanNode.Protocol == "psiphon" || cleanNode.IsCDNIP()
-	if sysProxyEnabled && s.proxyMgr != nil {
-		httpPort, _ := strconv.Atoi(s.db.GetSetting("http_port", "10809"))
-		if s.runner != nil {
-			st := s.runner.GetStatus()
-			if st.HTTPPort > 0 {
-				httpPort = st.HTTPPort
-			}
-		}
-		_ = s.proxyMgr.Enable(httpPort)
-	}
+	// Always enable Windows system proxy if enabled in settings or for Psiphon / CDN IP nodes
+	s.updateSystemProxy()
 
 	_, _ = s.db.RecordConnectionStart(cleanNode.ID, cleanNode.Server, cleanNode.Protocol)
 
@@ -1572,6 +1705,200 @@ func (s *Server) handleCleanIPSaveAll(w http.ResponseWriter, r *http.Request) {
 		"nodes":   savedNodes,
 		"message": fmt.Sprintf("%d Clean IP configs added to main list", len(savedNodes)),
 	})
+}
+
+func (s *Server) updateSystemProxy() {
+	if s.proxyMgr == nil {
+		return
+	}
+	sysProxyEnabled := s.db.GetSetting("system_proxy", "true") == "true"
+	if s.runner != nil {
+		activeNode := s.runner.GetActiveNode()
+		if activeNode != nil && (activeNode.Protocol == "psiphon" || activeNode.IsCDNIP()) {
+			sysProxyEnabled = true
+		}
+	}
+	if !sysProxyEnabled {
+		_ = s.proxyMgr.Disable()
+		return
+	}
+
+	httpPort := 10809
+	if hp, err := strconv.Atoi(s.db.GetSetting("http_port", "10809")); err == nil && hp > 0 {
+		httpPort = hp
+	}
+	if s.runner != nil {
+		st := s.runner.GetStatus()
+		if st.HTTPPort > 0 {
+			httpPort = st.HTTPPort
+		}
+	}
+
+	routingMode := s.db.GetSetting("routing_mode", "blacklist")
+	var bypassDomains []string
+	if routingMode == "blacklist" || routingMode == "bypass_iran" || routingMode == "" {
+		directRaw := s.db.GetSetting("direct_domains", "")
+		for _, line := range strings.Split(directRaw, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") {
+				bypassDomains = append(bypassDomains, line)
+			}
+		}
+	}
+
+	_ = s.proxyMgr.EnableWithBypass(httpPort, bypassDomains)
+}
+
+// SNI Spoofing Endpoints
+
+func (s *Server) handleSniSpoofStatus(w http.ResponseWriter, r *http.Request) {
+	if s.sniSpoofMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"running": false,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   s.sniSpoofMgr.GetStatus(),
+		"settings": s.sniSpoofMgr.GetConfig(),
+		"is_admin": tun.IsAdmin(),
+	})
+}
+
+func (s *Server) handleSniSpoofSettings(w http.ResponseWriter, r *http.Request) {
+	if s.sniSpoofMgr == nil {
+		writeErr(w, http.StatusInternalServerError, "SNI Spoofing manager not initialized")
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, s.sniSpoofMgr.GetConfig())
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var cfg snispoof.Config
+		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json payload")
+			return
+		}
+		cfg.Normalize()
+		s.sniSpoofMgr.SetConfig(cfg)
+
+		if s.db != nil {
+			_ = s.db.SetSetting("sni_spoof_enabled", strconv.FormatBool(cfg.Enabled))
+			_ = s.db.SetSetting("sni_spoof_engine", cfg.Engine)
+			_ = s.db.SetSetting("sni_spoof_listen_host", cfg.ListenHost)
+			_ = s.db.SetSetting("sni_spoof_listen_port", strconv.Itoa(cfg.ListenPort))
+			_ = s.db.SetSetting("sni_spoof_connect_ip", cfg.ConnectIP)
+			_ = s.db.SetSetting("sni_spoof_connect_port", strconv.Itoa(cfg.ConnectPort))
+			_ = s.db.SetSetting("sni_spoof_fake_sni", cfg.FakeSNI)
+		}
+
+		writeJSON(w, http.StatusOK, s.sniSpoofMgr.GetConfig())
+		return
+	}
+
+	writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func (s *Server) handleSniSpoofToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.sniSpoofMgr == nil {
+		writeErr(w, http.StatusInternalServerError, "SNI Spoofing manager not initialized")
+		return
+	}
+
+	cfg := s.sniSpoofMgr.GetConfig()
+	cfg.Enabled = !cfg.Enabled
+	s.sniSpoofMgr.SetConfig(cfg)
+
+	if s.db != nil {
+		_ = s.db.SetSetting("sni_spoof_enabled", strconv.FormatBool(cfg.Enabled))
+	}
+
+	if !cfg.Enabled && s.sniSpoofMgr.IsRunning() {
+		_ = s.sniSpoofMgr.Stop()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":  cfg.Enabled,
+		"running":  s.sniSpoofMgr.IsRunning(),
+		"status":   s.sniSpoofMgr.GetStatus(),
+		"settings": cfg,
+	})
+}
+
+func (s *Server) handleSniSpoofStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.sniSpoofMgr == nil {
+		writeErr(w, http.StatusInternalServerError, "SNI Spoofing manager not initialized")
+		return
+	}
+	if !tun.IsAdmin() {
+		writeErr(w, http.StatusForbidden, "Administrator privileges required to load WinDivert filter driver")
+		return
+	}
+
+	type StartReq struct {
+		TargetIP   string `json:"target_ip"`
+		TargetPort int    `json:"target_port"`
+		FakeSNI    string `json:"fake_sni"`
+	}
+	var req StartReq
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	target := req.TargetIP
+	port := req.TargetPort
+	fakeSNI := req.FakeSNI
+	var nodeID int64
+	var nodeName string
+
+	if target == "" && s.runner != nil {
+		if node := s.runner.GetActiveNode(); node != nil {
+			target = node.Server
+			if port <= 0 {
+				port = node.Port
+			}
+			nodeID = node.ID
+			nodeName = node.Name
+		}
+	}
+
+	if target == "" {
+		target = "188.114.98.0"
+	}
+	if port <= 0 {
+		port = 443
+	}
+
+	if err := s.sniSpoofMgr.Start(target, port, fakeSNI, nodeID, nodeName); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, s.sniSpoofMgr.GetStatus())
+}
+
+func (s *Server) handleSniSpoofStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.sniSpoofMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"message": "stopped"})
+		return
+	}
+
+	_ = s.sniSpoofMgr.Stop()
+	writeJSON(w, http.StatusOK, s.sniSpoofMgr.GetStatus())
 }
 
 

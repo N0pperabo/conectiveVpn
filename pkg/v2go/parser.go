@@ -522,6 +522,58 @@ func ConvertToXrayOutbound(c *models.Config) (M, error) {
 			"settings": settings,
 		}, nil
 
+	case "socks", "socks5":
+		server := M{
+			"address": c.Server,
+			"port":    c.Port,
+		}
+		if c.Password != "" || c.UUID != "" {
+			u := M{
+				"pass": c.Password,
+			}
+			if c.UUID != "" {
+				u["user"] = c.UUID
+			}
+			server["users"] = []M{u}
+		}
+		res := M{
+			"protocol": "socks",
+			"tag":      "proxy",
+			"settings": M{
+				"servers": []M{server},
+			},
+		}
+		if c.TLS != "" && c.TLS != "none" {
+			res["streamSettings"] = buildStreamSettings(c)
+		}
+		return res, nil
+
+	case "http":
+		server := M{
+			"address": c.Server,
+			"port":    c.Port,
+		}
+		if c.Password != "" || c.UUID != "" {
+			u := M{
+				"pass": c.Password,
+			}
+			if c.UUID != "" {
+				u["user"] = c.UUID
+			}
+			server["users"] = []M{u}
+		}
+		res := M{
+			"protocol": "http",
+			"tag":      "proxy",
+			"settings": M{
+				"servers": []M{server},
+			},
+		}
+		if c.TLS != "" && c.TLS != "none" {
+			res["streamSettings"] = buildStreamSettings(c)
+		}
+		return res, nil
+
 	default:
 		return nil, fmt.Errorf("protocol %s not supported by Xray outbound converter", c.Protocol)
 	}

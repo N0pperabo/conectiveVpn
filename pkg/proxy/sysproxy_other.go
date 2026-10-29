@@ -16,6 +16,10 @@ func (m *Manager) Enable(httpPort int) error {
 	return nil
 }
 
+func (m *Manager) EnableWithBypass(httpPort int, bypassDomains []string) error {
+	return nil
+}
+
 func (m *Manager) Disable() error {
 	return nil
 }

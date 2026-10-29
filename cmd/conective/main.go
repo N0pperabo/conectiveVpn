@@ -26,6 +26,7 @@ import (
 	"freenode/pkg/database"
 	"freenode/pkg/geoip"
 	"freenode/pkg/logger"
+	"freenode/pkg/mhr"
 	"freenode/pkg/proxy"
 	"freenode/pkg/scheduler"
 	"freenode/pkg/tray"
@@ -220,7 +221,9 @@ func main() {
 	defer schedCtrl.Stop()
 
 	// 7. API and UI Server
+	mhrMgr := mhr.NewManager(db, proxyMgr, dataDir)
 	apiServer := api.NewServer(db, v2goEngine, runner, proxyMgr, schedCtrl)
+	apiServer.SetMHRManager(mhrMgr)
 
 	// Static assets handler from embedded filesystem
 	subFS, err := fs.Sub(assets.WebFS, "web")
@@ -264,6 +267,18 @@ func main() {
 		if runner.IsRunning() {
 			log.Printf("[Shutdown] Stopping Xray client...")
 			_ = runner.Disconnect()
+		}
+
+		// Stop MHR Relay if running
+		if mhrMgr.IsRunning() {
+			log.Printf("[Shutdown] Stopping MHR Relay...")
+			_ = mhrMgr.Stop()
+		}
+
+		// Stop SNI Spoofing if running
+		if apiServer.SNISpoofManager() != nil && apiServer.SNISpoofManager().IsRunning() {
+			log.Printf("[Shutdown] Stopping SNI Spoofing...")
+			_ = apiServer.SNISpoofManager().Stop()
 		}
 
 		// Disable system proxy to leave Windows clean
