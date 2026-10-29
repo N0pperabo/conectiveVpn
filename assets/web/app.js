@@ -32,6 +32,18 @@ let isScanningOrPinging = false;
 let isFavoritesFilterActive = false;
 let latestDownloadURL = '';
 
+// Live Logs Viewer State
+var allLogs = [];
+var filteredLogs = [];
+var MAX_LOG_ENTRIES = 2000;
+var logIdSeq = 0;
+var logEventSource = null;
+var logReconnectTimeout = null;
+
+// MHR Relay State
+var mhrLiveStatus = { running: false, state: 'stopped' };
+var mhrScriptsCache = null;
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
@@ -230,6 +242,12 @@ function initEventListeners() {
   btnHistory.addEventListener('click', () => openModal('historyModal', loadHistory));
   const btnCleanIP = document.getElementById('btnCleanIP');
   if (btnCleanIP) btnCleanIP.addEventListener('click', () => openModal('cleanIPModal', loadCleanIPStatus));
+  const btnMHR = document.getElementById('btnMHR');
+  if (btnMHR) btnMHR.addEventListener('click', () => openModal('mhrModal', loadMHRModal));
+  const btnSniSpoof = document.getElementById('btnSniSpoof');
+  if (btnSniSpoof) btnSniSpoof.addEventListener('click', () => openModal('sniSpoofModal', loadSniSpoofModal));
+  initSniSpoofEventListeners();
+  initMHREventListeners();
   if (btnLogs) btnLogs.addEventListener('click', () => openModal('logsModal'));
   const btnStartCleanIP = document.getElementById('btnStartCleanIP');
   if (btnStartCleanIP) btnStartCleanIP.addEventListener('click', startCleanIPScan);
@@ -554,6 +572,7 @@ async function loadStatus() {
     updateConnectionUI(data.connection);
     updateScanUI(data.scan);
     updateStatsUI(data.stats);
+    if (data.mhr) updateMHRStatusUI(data.mhr);
   } catch (e) {
     console.error('Error loading status:', e);
   }
@@ -1935,9 +1954,9 @@ async function checkAllTrustScores() {
 function flagImg(code) {
   if (!code) return '';
   const c = code.toUpperCase();
-  if (c === 'CF' || c === 'CLOUDFLARE' || c === 'WW' || c === 'GLOBAL') return '☁️ ';
-  if (c === 'AUTO' || c === 'ANY') return '<span style="font-size: 15px; margin-inline-end: 4px;">🌐</span>';
-  if (code.length !== 2 || c === 'UN') return '<span style="font-size: 15px; margin-inline-end: 4px;">🌐</span>';
+  if (c === 'CF' || c === 'CLOUDFLARE' || c === 'WW' || c === 'GLOBAL') return '<span class="flag-cf" style="font-size: 10px; font-weight: bold; padding: 1px 4px; border-radius: 3px; background: rgba(255,255,255,0.1); margin-inline-end: 4px;">CDN</span>';
+  if (c === 'AUTO' || c === 'ANY') return '<span style="font-size: 15px; margin-inline-end: 4px;"></span>';
+  if (code.length !== 2 || c === 'UN') return '<span style="font-size: 15px; margin-inline-end: 4px;"></span>';
   return `<img class="flag-img" src="flags/${code.toLowerCase()}.svg" alt="${code}" loading="lazy" onerror="this.style.display='none'">`;
 }
 
@@ -2046,10 +2065,14 @@ function renderCleanIPResults(ips) {
   if (!tbody) return;
 
   if (ips.length === 0) {
+    const selectedRegion = document.getElementById('cleanIPEgressRegion')?.value || '';
+    const msg = selectedRegion
+      ? `هیچ آی‌پی تمیزی برای کشور ${selectedRegion} یافت نشد.`
+      : 'هنوز آی‌پی تمیزی یافت نشده است. روی <b>Start Clean IP Scan</b> کلیک کنید تا آی‌پی‌های پرسرعت Anycast پیدا شوند.';
     tbody.innerHTML = `
       <tr>
         <td colspan="6" class="text-center empty-state">
-          هنوز آی‌پی تمیزی یافت نشده است. روی <b>Start Clean IP Scan</b> کلیک کنید تا آی‌پی‌های پرسرعت Anycast پیدا شوند.
+          ${msg}
         </td>
       </tr>
     `;
@@ -2125,6 +2148,7 @@ function renderCleanIPResults(ips) {
 
 async function startCleanIPScan() {
   const cdnTarget = document.getElementById('cleanIPCDNTarget')?.value || 'akamai';
+  const country = document.getElementById('cleanIPEgressRegion')?.value || '';
   const workers = parseInt(document.getElementById('cleanIPWorkers')?.value || '100');
   const timeoutMs = parseInt(document.getElementById('cleanIPTimeout')?.value || '1500');
   const sampleSize = parseInt(document.getElementById('cleanIPSampleSize')?.value || '500');
@@ -2136,6 +2160,7 @@ async function startCleanIPScan() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         cdn_target: cdnTarget,
+        country: country,
         workers: workers,
         timeout_ms: timeoutMs,
         sample_size: sampleSize,
@@ -2564,12 +2589,8 @@ function toggleAppInTextarea(textareaId, exeName, typeName) {
 // Live System & Engine Logs Viewer
 // ==========================================
 
-let allLogs = [];
-let filteredLogs = [];
-const MAX_LOG_ENTRIES = 2000;
-let logIdSeq = 0;
-let logEventSource = null;
-let logReconnectTimeout = null;
+// (logs state declared at top)
+
 
 function initLogsViewer() {
   const btnLogsEl = document.getElementById('btnLogs');
@@ -2981,3 +3002,611 @@ function clearLogs() {
 
 
 
+
+
+// ==========================================
+// MHR (Master HTTP Relay) Frontend Logic
+// ==========================================
+
+// (mhr state declared at top)
+
+
+function initMHREventListeners() {
+  const form = document.getElementById('mhrConfigForm');
+  if (form) form.addEventListener('submit', saveMHRConfig);
+
+  const btnStart = document.getElementById('btnMHRStart');
+  if (btnStart) btnStart.addEventListener('click', startMHRRelay);
+
+  const btnStop = document.getElementById('btnMHRStop');
+  if (btnStop) btnStop.addEventListener('click', stopMHRRelay);
+
+  const btnTest = document.getElementById('btnMHRTest');
+  if (btnTest) btnTest.addEventListener('click', testMHRPing);
+
+  const btnScan = document.getElementById('btnMHRScanGoogleIP');
+  if (btnScan) btnScan.addEventListener('click', scanGoogleIPs);
+
+  const btnCloseScanner = document.getElementById('btnCloseMhrScanner');
+  if (btnCloseScanner) btnCloseScanner.addEventListener('click', () => {
+    const box = document.getElementById('mhrScannerBox');
+    if (box) box.style.display = 'none';
+  });
+
+  const btnToggleAuth = document.getElementById('btnToggleMhrAuth');
+  if (btnToggleAuth) {
+    btnToggleAuth.addEventListener('click', () => {
+      const authInput = document.getElementById('mhrAuthKey');
+      if (!authInput) return;
+      if (authInput.type === 'password') {
+        authInput.type = 'text';
+        btnToggleAuth.textContent = 'Hide';
+      } else {
+        authInput.type = 'password';
+        btnToggleAuth.textContent = 'Show';
+      }
+    });
+  }
+
+  const variantSelect = document.getElementById('mhrVariant');
+  if (variantSelect) {
+    variantSelect.addEventListener('change', () => {
+      const cfwBox = document.getElementById('mhrCFWBox');
+      if (cfwBox) {
+        cfwBox.style.display = variantSelect.value === 'mhr-cfw' ? 'flex' : 'none';
+      }
+    });
+  }
+
+  const btnCopyGas = document.getElementById('btnCopyAppsScript');
+  if (btnCopyGas) btnCopyGas.addEventListener('click', copyAppsScriptCode);
+
+  const btnCopyWorker = document.getElementById('btnCopyWorkerScript');
+  if (btnCopyWorker) btnCopyWorker.addEventListener('click', copyWorkerCode);
+
+  const btnInstallCA = document.getElementById('btnMHRInstallCA');
+  if (btnInstallCA) btnInstallCA.addEventListener('click', installMHRCA);
+
+  const btnUninstallCA = document.getElementById('btnMHRUninstallCA');
+  if (btnUninstallCA) btnUninstallCA.addEventListener('click', uninstallMHRCA);
+}
+
+async function loadMHRModal() {
+  try {
+    const res = await fetch('/api/mhr/config');
+    const cfg = await res.json();
+
+    const variantSelect = document.getElementById('mhrVariant');
+    if (variantSelect) variantSelect.value = cfg.variant || 'mhr';
+
+    const cfwBox = document.getElementById('mhrCFWBox');
+    if (cfwBox) {
+      cfwBox.style.display = (cfg.variant === 'mhr-cfw') ? 'flex' : 'none';
+    }
+
+    const scriptInput = document.getElementById('mhrScriptId');
+    if (scriptInput) scriptInput.value = cfg.script_id || '';
+
+    const authInput = document.getElementById('mhrAuthKey');
+    if (authInput) authInput.value = cfg.auth_key || '';
+
+    const googleIpInput = document.getElementById('mhrGoogleIP');
+    if (googleIpInput) googleIpInput.value = cfg.google_ip || '216.239.38.120';
+
+    const frontDomainInput = document.getElementById('mhrFrontDomain');
+    if (frontDomainInput) frontDomainInput.value = cfg.front_domain || 'www.google.com';
+
+    const httpPortInput = document.getElementById('mhrHttpPort');
+    if (httpPortInput) httpPortInput.value = cfg.http_port || 8085;
+
+    const socksPortInput = document.getElementById('mhrSocks5Port');
+    if (socksPortInput) socksPortInput.value = cfg.socks5_port || 1080;
+
+    const workerUrlInput = document.getElementById('mhrWorkerURL');
+    if (workerUrlInput) workerUrlInput.value = cfg.cfw_worker_url || '';
+
+    const chkSysProxy = document.getElementById('mhrChkSystemProxy');
+    if (chkSysProxy) chkSysProxy.checked = cfg.system_proxy !== false;
+
+    const chkLan = document.getElementById('mhrChkLANSharing');
+    if (chkLan) chkLan.checked = !!cfg.lan_sharing;
+
+    const statusRes = await fetch('/api/mhr/status');
+    const status = await statusRes.json();
+    updateMHRStatusUI(status);
+  } catch (err) {
+    console.error('Failed loading MHR configuration:', err);
+    showToast('Failed loading MHR configuration', 'error');
+  }
+}
+
+function updateMHRStatusUI(status) {
+  if (!status) return;
+  mhrLiveStatus = status;
+
+  // 1. Update hero bar badge
+  const heroBadge = document.getElementById('badgeMhrActive');
+  if (heroBadge) {
+    if (status.running) {
+      heroBadge.style.display = 'inline-block';
+      if (status.system_proxy) {
+        heroBadge.textContent = 'MHR: SYSTEM PROXY';
+        heroBadge.style.color = '#38bdf8';
+        heroBadge.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+      } else {
+        heroBadge.textContent = `MHR: ACTIVE (:${status.http_port})`;
+        heroBadge.style.color = '#60a5fa';
+        heroBadge.style.borderColor = 'rgba(96, 165, 250, 0.3)';
+      }
+    } else {
+      heroBadge.style.display = 'none';
+    }
+  }
+
+  // 2. Update modal pill
+  const pill = document.getElementById('mhrStatusPill');
+  if (pill) {
+    if (status.running) {
+      pill.textContent = 'RUNNING';
+      pill.style.background = 'rgba(16, 185, 129, 0.2)';
+      pill.style.color = '#10b981';
+    } else if (status.state === 'error') {
+      pill.textContent = 'ERROR';
+      pill.style.background = 'rgba(239, 68, 68, 0.2)';
+      pill.style.color = '#ef4444';
+    } else {
+      pill.textContent = 'STOPPED';
+      pill.style.background = 'rgba(148, 163, 184, 0.2)';
+      pill.style.color = '#94a3b8';
+    }
+  }
+
+  // 3. Update status details in modal
+  const textEl = document.getElementById('mhrStatusText');
+  if (textEl) {
+    if (status.running) {
+      textEl.textContent = `Running (PID: ${status.pid})`;
+      textEl.style.color = '#10b981';
+    } else if (status.state === 'error') {
+      textEl.textContent = status.error ? `Error: ${status.error}` : 'Failed to start';
+      textEl.style.color = '#ef4444';
+    } else {
+      textEl.textContent = 'Stopped';
+      textEl.style.color = '#94a3b8';
+    }
+  }
+
+  const httpEl = document.getElementById('mhrLblHttpPort');
+  if (httpEl && status.http_port) httpEl.textContent = status.http_port;
+
+  const socksEl = document.getElementById('mhrLblSocksPort');
+  if (socksEl && status.socks5_port) socksEl.textContent = status.socks5_port;
+
+  const latEl = document.getElementById('mhrLblLatency');
+  if (latEl) {
+    latEl.textContent = status.latency > 0 ? `${status.latency} ms` : '-- ms';
+  }
+
+  const exitIpEl = document.getElementById('mhrLblExitIP');
+  if (exitIpEl) {
+    exitIpEl.textContent = status.exit_ip || '--';
+  }
+
+  // 4. Update buttons
+  const btnStart = document.getElementById('btnMHRStart');
+  const btnStop = document.getElementById('btnMHRStop');
+  const btnTest = document.getElementById('btnMHRTest');
+
+  if (btnStart) btnStart.style.display = status.running ? 'none' : 'inline-block';
+  if (btnStop) btnStop.style.display = status.running ? 'inline-block' : 'none';
+  if (btnTest) btnTest.disabled = !status.running;
+}
+
+async function saveMHRConfig(e) {
+  if (e) e.preventDefault();
+
+  const cfg = {
+    variant: document.getElementById('mhrVariant')?.value || 'mhr',
+    script_id: document.getElementById('mhrScriptId')?.value?.trim() || '',
+    auth_key: document.getElementById('mhrAuthKey')?.value?.trim() || '',
+    google_ip: document.getElementById('mhrGoogleIP')?.value?.trim() || '216.239.38.120',
+    front_domain: document.getElementById('mhrFrontDomain')?.value?.trim() || 'www.google.com',
+    http_port: parseInt(document.getElementById('mhrHttpPort')?.value, 10) || 8085,
+    socks5_port: parseInt(document.getElementById('mhrSocks5Port')?.value, 10) || 1080,
+    cfw_worker_url: document.getElementById('mhrWorkerURL')?.value?.trim() || '',
+    system_proxy: !!document.getElementById('mhrChkSystemProxy')?.checked,
+    lan_sharing: !!document.getElementById('mhrChkLANSharing')?.checked,
+  };
+
+  try {
+    const res = await fetch('/api/mhr/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showToast('Error saving MHR config: ' + data.error, 'error');
+    } else {
+      showToast('MHR configuration saved successfully', 'success');
+      mhrScriptsCache = null; // Invalidate scripts cache
+    }
+  } catch (err) {
+    showToast('Failed to save MHR config: ' + err.message, 'error');
+  }
+}
+
+async function startMHRRelay() {
+  const btnStart = document.getElementById('btnMHRStart');
+  if (btnStart) {
+    btnStart.disabled = true;
+    btnStart.textContent = 'Starting...';
+  }
+
+  try {
+    // Save configuration first to guarantee latest values are on disk
+    await saveMHRConfig();
+
+    const res = await fetch('/api/mhr/start', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      showToast('MHR Start Failed: ' + data.error, 'error');
+    } else {
+      showToast(data.message || 'MHR Relay started successfully', 'success');
+    }
+    const stRes = await fetch('/api/mhr/status');
+    const st = await stRes.json();
+    updateMHRStatusUI(st);
+  } catch (err) {
+    showToast('Error starting MHR relay: ' + err.message, 'error');
+  } finally {
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.textContent = 'Start Relay';
+    }
+  }
+}
+
+async function stopMHRRelay() {
+  const btnStop = document.getElementById('btnMHRStop');
+  if (btnStop) {
+    btnStop.disabled = true;
+    btnStop.textContent = 'Stopping...';
+  }
+
+  try {
+    const res = await fetch('/api/mhr/stop', { method: 'POST' });
+    const data = await res.json();
+    showToast(data.message || 'MHR Relay stopped', 'info');
+    const stRes = await fetch('/api/mhr/status');
+    const st = await stRes.json();
+    updateMHRStatusUI(st);
+  } catch (err) {
+    showToast('Error stopping MHR: ' + err.message, 'error');
+  } finally {
+    if (btnStop) {
+      btnStop.disabled = false;
+      btnStop.textContent = 'Stop Relay';
+    }
+  }
+}
+
+async function testMHRPing() {
+  const btnTest = document.getElementById('btnMHRTest');
+  if (btnTest) {
+    btnTest.disabled = true;
+    btnTest.textContent = 'Testing...';
+  }
+
+  try {
+    const res = await fetch('/api/mhr/test', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      showToast('MHR Ping Failed: ' + data.error, 'error');
+    } else {
+      showToast(`MHR OK: Latency ${data.latency} ms (Exit IP: ${data.exit_ip || 'Unknown'})`, 'success');
+      const latEl = document.getElementById('mhrLblLatency');
+      if (latEl) latEl.textContent = `${data.latency} ms`;
+      const exitEl = document.getElementById('mhrLblExitIP');
+      if (exitEl) exitEl.textContent = data.exit_ip || '--';
+    }
+  } catch (err) {
+    showToast('Test request failed: ' + err.message, 'error');
+  } finally {
+    if (btnTest) {
+      btnTest.disabled = false;
+      btnTest.textContent = 'Test Ping';
+    }
+  }
+}
+
+async function scanGoogleIPs() {
+  const btnScan = document.getElementById('btnMHRScanGoogleIP');
+  const box = document.getElementById('mhrScannerBox');
+  const tbody = document.getElementById('mhrScannerTableBody');
+
+  if (btnScan) {
+    btnScan.disabled = true;
+    btnScan.textContent = 'Scanning...';
+  }
+  if (box) box.style.display = 'block';
+  if (tbody) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:12px; color:var(--text-muted);"><div class="spinner" style="margin: 0 auto 6px;"></div>Probing candidate Google edge IPs with TLS SNI fronting...</td></tr>';
+  }
+
+  const frontDomain = document.getElementById('mhrFrontDomain')?.value?.trim() || 'www.google.com';
+
+  try {
+    const res = await fetch('/api/mhr/scan-google-ip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ front_domain: frontDomain, timeout_ms: 2500 }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showToast('Scan failed: ' + data.error, 'error');
+      if (tbody) tbody.innerHTML = `<tr><td colspan="5" style="color:#ef4444; text-align:center;">${data.error}</td></tr>`;
+      return;
+    }
+
+    if (!data.results || data.results.length === 0) {
+      if (tbody) tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No IPs tested.</td></tr>';
+      return;
+    }
+
+    let html = '';
+    data.results.forEach((item, idx) => {
+      const latBadge = item.reachable
+        ? `<span style="color:#10b981; font-weight:600;">${item.latency_ms} ms</span>`
+        : '<span style="color:#ef4444;">Unreachable</span>';
+      const statusBadge = item.reachable
+        ? '<span class="badge badge-success" style="font-size:10px;">Clean</span>'
+        : `<span class="badge" style="background:rgba(239,68,68,0.2); color:#ef4444; font-size:10px;">${item.error || 'Blocked'}</span>`;
+      const actionBtn = item.reachable
+        ? `<button type="button" class="btn btn-secondary btn-sm" style="font-size:11px; padding:2px 8px;" onclick="applyGoogleIP('${item.ip}')">Apply</button>`
+        : '<span style="color:var(--text-muted); font-size:11px;">--</span>';
+
+      html += `<tr>
+        <td>${idx + 1}</td>
+        <td style="font-family:monospace; font-weight:600;">${item.ip}</td>
+        <td>${latBadge}</td>
+        <td>${statusBadge}</td>
+        <td>${actionBtn}</td>
+      </tr>`;
+    });
+
+    if (tbody) tbody.innerHTML = html;
+
+    if (data.fastest_ip) {
+      showToast(`Fastest Google IP found: ${data.fastest_ip} (${data.working_count} reachable)`, 'success');
+    }
+  } catch (err) {
+    showToast('Scan error: ' + err.message, 'error');
+  } finally {
+    if (btnScan) {
+      btnScan.disabled = false;
+      btnScan.textContent = 'Scan Clean IP';
+    }
+  }
+}
+
+function applyGoogleIP(ip) {
+  const input = document.getElementById('mhrGoogleIP');
+  if (input) {
+    input.value = ip;
+    showToast(`Applied Google IP: ${ip}`, 'success');
+  }
+}
+
+async function fetchMHRScripts() {
+  if (mhrScriptsCache) return mhrScriptsCache;
+  const res = await fetch('/api/mhr/scripts');
+  const data = await res.json();
+  mhrScriptsCache = data;
+  return data;
+}
+
+async function copyAppsScriptCode() {
+  try {
+    const scripts = await fetchMHRScripts();
+    if (!scripts || !scripts.apps_script_code) {
+      showToast('Could not load Apps Script code template', 'error');
+      return;
+    }
+    await navigator.clipboard.writeText(scripts.apps_script_code);
+    showToast('Apps Script (Code.gs) copied to clipboard!', 'success');
+  } catch (e) {
+    showToast('Clipboard copy failed: ' + e.message, 'error');
+  }
+}
+
+async function copyWorkerCode() {
+  try {
+    const scripts = await fetchMHRScripts();
+    if (!scripts || !scripts.worker_code) {
+      showToast('Could not load Cloudflare Worker code template', 'error');
+      return;
+    }
+    await navigator.clipboard.writeText(scripts.worker_code);
+    showToast('Cloudflare Worker (worker.js) copied to clipboard!', 'success');
+  } catch (e) {
+    showToast('Clipboard copy failed: ' + e.message, 'error');
+  }
+}
+
+async function installMHRCA() {
+  try {
+    const res = await fetch('/api/mhr/install-ca', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      showToast('Failed to install CA: ' + data.error, 'error');
+    } else {
+      showToast('MHR Root CA installed into Windows Certificate Store', 'success');
+    }
+  } catch (err) {
+    showToast('Install CA request failed: ' + err.message, 'error');
+  }
+}
+
+async function uninstallMHRCA() {
+  try {
+    const res = await fetch('/api/mhr/uninstall-ca', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      showToast('Failed to remove CA: ' + data.error, 'error');
+    } else {
+      showToast('MHR Root CA removed from Windows Certificate Store', 'info');
+    }
+  } catch (err) {
+    showToast('Remove CA request failed: ' + err.message, 'error');
+  }
+}
+
+
+// ==========================================
+// SNI Spoofing Subsystem UI Controllers
+// ==========================================
+
+function initSniSpoofEventListeners() {
+  const btnToggle = document.getElementById('btnToggleSniSpoof');
+  if (btnToggle) btnToggle.addEventListener('click', toggleSniSpoof);
+
+  const form = document.getElementById('sniSpoofForm');
+  if (form) form.addEventListener('submit', saveSniSpoofForm);
+
+  document.querySelectorAll('.btn-sni-preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sni = btn.getAttribute('data-sni');
+      const input = document.getElementById('txtSniSpoofFakeSNI');
+      if (input && sni) input.value = sni;
+    });
+  });
+}
+
+async function loadSniSpoofModal() {
+  try {
+    const res = await fetch('/api/snispoof/status');
+    const data = await res.json();
+    const st = data.status || {};
+    const cfg = data.settings || {};
+
+    const pill = document.getElementById('sniSpoofStatusPill');
+    const txt = document.getElementById('sniSpoofStatusText');
+    const btnToggle = document.getElementById('btnToggleSniSpoof');
+    const chk = document.getElementById('chkSniSpoofEnabled');
+    const selEngine = document.getElementById('selSniSpoofEngine');
+    const txtPort = document.getElementById('txtSniSpoofListenPort');
+    const txtFakeSNI = document.getElementById('txtSniSpoofFakeSNI');
+    const txtConnectIP = document.getElementById('txtSniSpoofConnectIP');
+    const txtConnectPort = document.getElementById('txtSniSpoofConnectPort');
+    const lblListenPort = document.getElementById('sniSpoofLblListenPort');
+    const lblTarget = document.getElementById('sniSpoofLblTarget');
+    const engineText = document.getElementById('sniSpoofActiveEngineText');
+
+    if (chk) chk.checked = !!cfg.enabled;
+    if (selEngine) selEngine.value = cfg.engine || 'auto';
+    if (txtPort) txtPort.value = cfg.listen_port || 40443;
+    if (lblListenPort) lblListenPort.textContent = cfg.listen_port || 40443;
+    if (txtFakeSNI) txtFakeSNI.value = cfg.fake_sni || 'auth.vercel.com';
+    if (txtConnectIP) txtConnectIP.value = cfg.connect_ip || '';
+    if (txtConnectPort) txtConnectPort.value = cfg.connect_port || '';
+
+    if (st.running) {
+      if (pill) {
+        pill.textContent = 'ACTIVE';
+        pill.style.background = 'rgba(168, 85, 247, 0.2)';
+        pill.style.color = '#c084fc';
+      }
+      if (txt) {
+        txt.textContent = 'Running';
+        txt.style.color = '#c084fc';
+      }
+      if (btnToggle) {
+        btnToggle.textContent = 'Disable SNI Spoof';
+        btnToggle.className = 'btn btn-danger btn-sm';
+      }
+      if (lblTarget) {
+        lblTarget.textContent = (st.target_ip || 'Auto') + ':' + (st.target_port || 443);
+      }
+      if (engineText) {
+        engineText.textContent = st.active_engine || 'Running';
+      }
+    } else {
+      if (pill) {
+        pill.textContent = cfg.enabled ? 'READY (IDLE)' : 'DISABLED';
+        pill.style.background = cfg.enabled ? 'rgba(59, 130, 246, 0.2)' : 'rgba(148, 163, 184, 0.2)';
+        pill.style.color = cfg.enabled ? '#60a5fa' : '#94a3b8';
+      }
+      if (txt) {
+        txt.textContent = cfg.enabled ? 'Enabled (Applies on Connect)' : 'Stopped';
+        txt.style.color = cfg.enabled ? '#60a5fa' : '#94a3b8';
+      }
+      if (btnToggle) {
+        btnToggle.textContent = cfg.enabled ? 'Disable SNI Spoof' : 'Enable SNI Spoof';
+        btnToggle.className = cfg.enabled ? 'btn btn-secondary btn-sm' : 'btn btn-primary btn-sm';
+      }
+      if (lblTarget) {
+        lblTarget.textContent = cfg.connect_ip ? (cfg.connect_ip + ':' + (cfg.connect_port || 443)) : 'Auto (Active Node)';
+      }
+      if (engineText) {
+        engineText.textContent = cfg.engine || 'Auto';
+      }
+    }
+
+    // Top button badge
+    const badgeTop = document.getElementById('badgeSniSpoofTop');
+    if (badgeTop) {
+      badgeTop.style.display = cfg.enabled ? 'inline-block' : 'none';
+    }
+  } catch (err) {
+    console.error('Failed to load SNI Spoof modal status:', err);
+  }
+}
+
+async function toggleSniSpoof() {
+  try {
+    const res = await fetch('/api/snispoof/toggle', { method: 'POST' });
+    const data = await res.json();
+    showToast(data.enabled ? 'SNI Spoofing enabled' : 'SNI Spoofing disabled', 'info');
+    await loadSniSpoofModal();
+  } catch (err) {
+    showToast('Failed to toggle SNI Spoofing: ' + err.message, 'error');
+  }
+}
+
+async function saveSniSpoofForm(e) {
+  if (e) e.preventDefault();
+  const chk = document.getElementById('chkSniSpoofEnabled');
+  const selEngine = document.getElementById('selSniSpoofEngine');
+  const txtPort = document.getElementById('txtSniSpoofListenPort');
+  const txtFakeSNI = document.getElementById('txtSniSpoofFakeSNI');
+  const txtConnectIP = document.getElementById('txtSniSpoofConnectIP');
+  const txtConnectPort = document.getElementById('txtSniSpoofConnectPort');
+
+  const payload = {
+    enabled: chk ? chk.checked : false,
+    engine: selEngine ? selEngine.value : 'auto',
+    listen_host: '127.0.0.1',
+    listen_port: parseInt(txtPort ? txtPort.value : '40443', 10) || 40443,
+    connect_ip: txtConnectIP ? txtConnectIP.value.trim() : '',
+    connect_port: parseInt(txtConnectPort ? txtConnectPort.value : '443', 10) || 443,
+    fake_sni: txtFakeSNI ? txtFakeSNI.value.trim() : 'auth.vercel.com',
+  };
+
+  try {
+    const res = await fetch('/api/snispoof/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      showToast('SNI Spoofing settings saved successfully', 'success');
+      await loadSniSpoofModal();
+    } else {
+      const err = await res.json();
+      showToast('Failed saving settings: ' + (err.error || res.statusText), 'error');
+    }
+  } catch (err) {
+    showToast('Network error saving settings: ' + err.message, 'error');
+  }
+}

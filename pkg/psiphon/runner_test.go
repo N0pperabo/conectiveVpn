@@ -161,3 +161,131 @@ func TestBuildArgs_CdnMode(t *testing.T) {
 		t.Fatalf("expected --psiphon-region DE in args, but got: %v", argsCDN)
 	}
 }
+
+func TestBuildShiroKhorshidConfig(t *testing.T) {
+	// 1. Config with CDN edges
+	cfgBytes, err := BuildShiroKhorshidConfig(ShiroConfigOptions{
+		SocksPort:      10808,
+		HTTPPort:       10809,
+		DataDir:        "C:\\test\\psiphon",
+		EgressRegion:   "DE",
+		TunnelPoolSize: 2,
+		CdnFronting:    true,
+		CdnEdges:       []string{"184.24.77.42", "23.209.210.213"},
+		SNI:            "a248.e.akamai.net",
+	})
+	if err != nil {
+		t.Fatalf("failed building shiro config: %v", err)
+	}
+
+	str := string(cfgBytes)
+	if !strings.Contains(str, `"EgressRegion": "DE"`) {
+		t.Errorf("expected EgressRegion DE")
+	}
+	if !strings.Contains(str, `"TunnelPoolSize": 2`) {
+		t.Errorf("expected TunnelPoolSize 2")
+	}
+	if !strings.Contains(str, `"LocalSocksProxyPort": 10808`) {
+		t.Errorf("expected LocalSocksProxyPort 10808")
+	}
+	if !strings.Contains(str, `"LocalHttpProxyPort": 10809`) {
+		t.Errorf("expected LocalHttpProxyPort 10809")
+	}
+	if !strings.Contains(str, `"184.24.77.42"`) {
+		t.Errorf("expected edge 184.24.77.42")
+	}
+	if !strings.Contains(str, `"23.209.210.213"`) {
+		t.Errorf("expected edge 23.209.210.213")
+	}
+	if !strings.Contains(str, "CdnFrontingSpecs") {
+		t.Errorf("expected CdnFrontingSpecs in config")
+	}
+	if !strings.Contains(str, "RemoteServerListURLs") {
+		t.Errorf("expected RemoteServerListURLs")
+	}
+	if !strings.Contains(str, "ObfuscatedServerListRootURLs") {
+		t.Errorf("expected ObfuscatedServerListRootURLs")
+	}
+
+	// 2. Direct config without CDN edges
+	directBytes, err := BuildShiroKhorshidConfig(ShiroConfigOptions{
+		SocksPort:    10808,
+		HTTPPort:     10809,
+		DataDir:      "C:\\test\\psiphon",
+		EgressRegion: "AUTO",
+		CdnFronting:  false,
+	})
+	if err != nil {
+		t.Fatalf("failed building direct config: %v", err)
+	}
+	dStr := string(directBytes)
+	if !strings.Contains(dStr, `"EgressRegion": ""`) {
+		t.Errorf("expected empty EgressRegion for AUTO, got:\n%s", dStr)
+	}
+	if strings.Contains(dStr, "CdnFrontingSpecs") {
+		t.Errorf("expected no CdnFrontingSpecs in direct config")
+	}
+}
+
+func TestParseNotice(t *testing.T) {
+	// Formatted notice with ISO timestamp
+	raw := `2026-10-29T07:05:07.809Z ListeningSocksProxyPort {"port":12080}`
+	n := ParseNotice(raw)
+	if n == nil {
+		t.Fatalf("failed parsing formatted notice")
+	}
+	if n.NoticeType != "ListeningSocksProxyPort" {
+		t.Errorf("expected ListeningSocksProxyPort, got %s", n.NoticeType)
+	}
+
+	// Tunnels notice
+	rawTunnels := `2026-10-29T07:05:14.567Z Tunnels {"count":1}`
+	nT := ParseNotice(rawTunnels)
+	if nT == nil {
+		t.Fatalf("failed parsing Tunnels notice")
+	}
+	if nT.NoticeType != "Tunnels" {
+		t.Errorf("expected Tunnels, got %s", nT.NoticeType)
+	}
+	if c, ok := nT.Data["count"].(float64); !ok || c != 1 {
+		t.Errorf("expected count 1, got %v", nT.Data["count"])
+	}
+
+	// Raw JSON notice
+	rawJSON := `{"noticeType":"CandidateServers","data":{"count":42}}`
+	nJ := ParseNotice(rawJSON)
+	if nJ == nil {
+		t.Fatalf("failed parsing raw JSON notice")
+	}
+	if nJ.NoticeType != "CandidateServers" {
+		t.Errorf("expected CandidateServers, got %s", nJ.NoticeType)
+	}
+
+	// FormatNoticeLog
+	logStr := FormatNoticeLog(nT)
+	if !strings.Contains(logStr, "Connected! Active tunnels: 1") {
+		t.Errorf("unexpected FormatNoticeLog output: %s", logStr)
+	}
+}
+
+func TestParseCdnEdges(t *testing.T) {
+	raw := "184.24.77.42, 23.209.210.213\n92.123.102.43; 2.22.250.149#comment"
+	edges := ParseCdnEdges(raw)
+	if len(edges) != 4 {
+		t.Fatalf("expected 4 edges, got %d: %v", len(edges), edges)
+	}
+	if edges[0] != "184.24.77.42" || edges[1] != "23.209.210.213" || edges[2] != "92.123.102.43" || edges[3] != "2.22.250.149" {
+		t.Errorf("unexpected edges: %v", edges)
+	}
+}
+
+func TestEnsurePsiphonServerList(t *testing.T) {
+	tmpDir := t.TempDir()
+	path, err := EnsurePsiphonServerList(tmpDir)
+	if err != nil {
+		t.Fatalf("EnsurePsiphonServerList failed: %v", err)
+	}
+	if !strings.HasSuffix(path, "server_list.dat") {
+		t.Errorf("expected path ending in server_list.dat, got %s", path)
+	}
+}

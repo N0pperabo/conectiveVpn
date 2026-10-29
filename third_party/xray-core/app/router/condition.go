@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -375,8 +374,12 @@ func NewProcessNameMatcher(names []string) *ProcessNameMatcher {
 			absPaths = append(absPaths, name)
 			continue
 		}
-		// curl.exe or curl
-		processNames = append(processNames, strings.TrimSuffix(name, ".exe"))
+		// curl.exe or curl (case-insensitive extension trimming)
+		lowerName := strings.ToLower(name)
+		if strings.HasSuffix(lowerName, ".exe") {
+			name = name[:len(name)-4]
+		}
+		processNames = append(processNames, name)
 	}
 	return &ProcessNameMatcher{
 		ProcessNames:  processNames,
@@ -417,14 +420,18 @@ func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
 			return true
 		}
 	}
-	if slices.Contains(m.ProcessNames, name) {
-		return true
+	for _, p := range m.ProcessNames {
+		if strings.EqualFold(p, name) {
+			return true
+		}
 	}
-	if slices.Contains(m.AbsPaths, absPath) {
-		return true
+	for _, a := range m.AbsPaths {
+		if strings.EqualFold(a, absPath) {
+			return true
+		}
 	}
 	for _, f := range m.Folders {
-		if strings.HasPrefix(absPath, f) {
+		if strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(f)) {
 			return true
 		}
 	}

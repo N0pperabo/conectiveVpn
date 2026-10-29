@@ -1,9 +1,11 @@
 package main
 
 import (
+	"embed"
 	_ "embed"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,11 +24,8 @@ var binGeoIP []byte
 //go:embed wintun.dll
 var binWintun []byte
 
-//go:embed bin/aether.exe
-var binAether []byte
-
-//go:embed bin/psiphon-tunnel-core.exe
-var binPsiphon []byte
+//go:embed all:bin
+var embeddedBin embed.FS
 
 var (
 	modUser32     = syscall.NewLazyDLL("user32.dll")
@@ -106,15 +105,27 @@ func main() {
 		_ = os.WriteFile(targetWintun, binWintun, 0755)
 	}
 
-	// 5. Extract circumvention binaries (aether.exe & psiphon-tunnel-core.exe)
+	// 5. Extract circumvention binaries (aether.exe, psiphon-tunnel-core.exe, sni-spoofing, etc.)
 	targetBin := filepath.Join(installDir, "bin")
 	_ = os.MkdirAll(targetBin, 0755)
-	if len(binAether) > 0 {
-		_ = os.WriteFile(filepath.Join(targetBin, "aether.exe"), binAether, 0755)
-	}
-	if len(binPsiphon) > 0 {
-		_ = os.WriteFile(filepath.Join(targetBin, "psiphon-tunnel-core.exe"), binPsiphon, 0755)
-	}
+	_ = fs.WalkDir(embeddedBin, "bin", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || path == "bin" {
+			return nil
+		}
+		rel, err := filepath.Rel("bin", path)
+		if err != nil {
+			return nil
+		}
+		dest := filepath.Join(targetBin, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dest, 0755)
+		}
+		data, err := embeddedBin.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		return os.WriteFile(dest, data, 0755)
+	})
 
 	// 6. Create Desktop Shortcut
 	desktopDir := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")

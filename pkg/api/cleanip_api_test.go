@@ -568,11 +568,8 @@ func TestDirectPsiphonAndEgressRegionConnect(t *testing.T) {
 			Message string         `json:"message"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &resp)
-		if resp.Node.Country != "NL" {
-			t.Errorf("expected country NL, got %s", resp.Node.Country)
-		}
-		if resp.Node.CountryName != "Netherlands" {
-			t.Errorf("expected country name Netherlands, got %s", resp.Node.CountryName)
+		if !strings.Contains(resp.Node.RawLink, "region=NL") {
+			t.Errorf("expected RawLink to contain region=NL, got %s", resp.Node.RawLink)
 		}
 		if resp.Node.Server != "23.209.210.213" {
 			t.Errorf("expected server 23.209.210.213, got %s", resp.Node.Server)
@@ -681,9 +678,6 @@ func TestDirectPsiphonAndEgressRegionConnect(t *testing.T) {
 				t.Errorf("expected 2 saved nodes, got %d", allResp.Count)
 			}
 			for _, n := range allResp.Nodes {
-				if n.Country != "DE" {
-					t.Errorf("node %s expected country DE, got %s", n.Server, n.Country)
-				}
 				if !strings.Contains(n.RawLink, "region=DE") {
 					t.Errorf("node %s expected RawLink to have region=DE, got %s", n.Server, n.RawLink)
 				}

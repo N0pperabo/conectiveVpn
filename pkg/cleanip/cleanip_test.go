@@ -654,3 +654,91 @@ func TestCreateOrUpdateDirectPsiphonNode(t *testing.T) {
 
 
 
+
+func TestGetShiroKhorshidEdges(t *testing.T) {
+	curated := GetShiroKhorshidCuratedIPs()
+	if len(curated) == 0 {
+		t.Fatalf("expected non-empty curated IPs")
+	}
+	if curated[0] != ShirOKhorshidCuratedIPs[0] {
+		t.Errorf("expected %s, got %s", ShirOKhorshidCuratedIPs[0], curated[0])
+	}
+
+	top := GetTopFrontingEdges(nil, 5)
+	if len(top) != 5 {
+		t.Fatalf("expected 5 top edges, got %d", len(top))
+	}
+}
+
+func TestCountryTargetedScanningAndCleanIPNode(t *testing.T) {
+	geoPaths := []string{
+		"../../assets/GeoLite2-Country.mmdb",
+		"assets/GeoLite2-Country.mmdb",
+	}
+
+	var geoPath string
+	for _, p := range geoPaths {
+		if _, err := os.Stat(p); err == nil {
+			geoPath = p
+			break
+		}
+	}
+
+	if geoPath == "" {
+		t.Skip("GeoLite2-Country.mmdb not found, skipping country targeted scanning test")
+	}
+
+	resolver, err := geoip.New(geoPath)
+	if err != nil {
+		t.Fatalf("failed to load GeoIP: %v", err)
+	}
+	defer resolver.Close()
+
+	orig := GetDefaultGeoResolver()
+	SetDefaultGeoResolver(resolver)
+	defer SetDefaultGeoResolver(orig)
+
+	// 1. Scan with specific country DE -> ALL candidates MUST be DE
+	deCandidates := GenerateCandidateIPsForTargetAndCountry("akamai", nil, 10, "DE", resolver)
+	if len(deCandidates) == 0 {
+		t.Fatalf("expected candidates for DE, got 0")
+	}
+	for _, c := range deCandidates {
+		g := resolver.Lookup(c.IP)
+		if g.Code != "DE" {
+			t.Errorf("expected candidate IP %s to be DE, got %s", c.IP, g.Code)
+		}
+	}
+
+	// 2. Scan with AUTO (empty country) -> candidates should be from global pool
+	autoCandidates := GenerateCandidateIPsForTargetAndCountry("akamai", nil, 50, "", resolver)
+	if len(autoCandidates) == 0 {
+		t.Fatalf("expected candidates for AUTO, got 0")
+	}
+
+	// 3. Scan with non-existent country -> returns 0 candidates
+	emptyCandidates := GenerateCandidateIPsForTargetAndCountry("akamai", nil, 10, "XX", resolver)
+	if len(emptyCandidates) != 0 {
+		t.Errorf("expected 0 candidates for non-existent country XX, got %d", len(emptyCandidates))
+	}
+
+	// 4. CreateOrUpdateCleanIPNodeWithRegion: IP is in Romania (RO), region passed is US
+	// IP's true Country MUST remain RO, NOT overridden to US
+	roIP := "92.123.102.43"
+	node, err := CreateOrUpdateCleanIPNodeWithRegion(nil, roIP, 120, "", "US")
+	if err != nil {
+		t.Fatalf("CreateOrUpdateCleanIPNodeWithRegion failed: %v", err)
+	}
+	if node.Country != "RO" {
+		t.Errorf("expected node Country to be RO (IP's true country), got %s", node.Country)
+	}
+	if node.CountryName != "Romania" {
+		t.Errorf("expected node CountryName to be Romania, got %s", node.CountryName)
+	}
+	if !strings.Contains(node.Name, "Romania") {
+		t.Errorf("expected node name to contain Romania, got %s", node.Name)
+	}
+	if !strings.Contains(node.RawLink, "region=US") {
+		t.Errorf("expected rawlink to contain region=US, got %s", node.RawLink)
+	}
+}

@@ -207,6 +207,15 @@ func (d *DB) migrate() error {
 	_, _ = d.db.Exec("UPDATE settings SET value = 'N0pperabo/conectiveVpn' WHERE key = 'update_repo' AND (value = 'connective-app/connective' OR value = 'N0pperabo/conective' OR value = '' OR value IS NULL)")
 	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('update_repo', 'N0pperabo/conectiveVpn')")
 
+	// Seed default SNI Spoofing settings
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_enabled', 'false')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_engine', 'auto')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_listen_host', '127.0.0.1')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_listen_port', '40443')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_connect_ip', '')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_connect_port', '443')")
+	_, _ = d.db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('sni_spoof_fake_sni', 'auth.vercel.com')")
+
 	return nil
 }
 

@@ -4,6 +4,8 @@ package proxy
 
 import (
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -57,8 +59,105 @@ func (m *Manager) BackupCurrentState() error {
 	return nil
 }
 
-// Enable sets the Windows system proxy to 127.0.0.1:port
+// BuildProxyOverride formats the Windows WinINet ProxyOverride string with default private ranges
+// and user-configured bypass domains/IPs.
+func BuildProxyOverride(bypassDomains []string) string {
+	baseEntries := []string{
+		"<local>",
+		"localhost",
+		"127.*",
+		"10.*",
+		"172.16.*",
+		"172.17.*",
+		"172.18.*",
+		"172.19.*",
+		"172.20.*",
+		"172.21.*",
+		"172.22.*",
+		"172.23.*",
+		"172.24.*",
+		"172.25.*",
+		"172.26.*",
+		"172.27.*",
+		"172.28.*",
+		"172.29.*",
+		"172.30.*",
+		"172.31.*",
+		"192.168.*",
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+	for _, b := range baseEntries {
+		key := strings.ToLower(b)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, b)
+		}
+	}
+
+	for _, raw := range bypassDomains {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, ".ir$") || lower == "domain:ir" || lower == "*.ir" || lower == "ir" || lower == ".ir" {
+			if !seen["*.ir"] {
+				seen["*.ir"] = true
+				result = append(result, "*.ir")
+			}
+			continue
+		}
+
+		// Strip protocol
+		if idx := strings.Index(line, "://"); idx != -1 {
+			line = line[idx+3:]
+		}
+		// Strip path and query parameters
+		if idx := strings.IndexAny(line, "/?#"); idx != -1 {
+			line = line[:idx]
+		}
+		// Strip port if host:port
+		if !strings.Contains(line, "]") && strings.Count(line, ":") == 1 {
+			if h, _, err := net.SplitHostPort(line); err == nil {
+				line = h
+			}
+		}
+		// Strip rule prefixes
+		line = strings.TrimPrefix(line, "domain:")
+		line = strings.TrimPrefix(line, "full:")
+		line = strings.TrimPrefix(line, "keyword:")
+		line = strings.TrimPrefix(line, "*.")
+		line = strings.TrimPrefix(line, ".")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// In WinINet ProxyOverride:
+		// *example.com matches example.com, www.example.com, and any subdomain
+		// *.example.com matches subdomains explicitly
+		// example.com matches the exact host
+		for _, p := range []string{"*" + line, "*." + line, line} {
+			pLower := strings.ToLower(p)
+			if !seen[pLower] {
+				seen[pLower] = true
+				result = append(result, p)
+			}
+		}
+	}
+
+	return strings.Join(result, ";")
+}
+
+// Enable sets the Windows system proxy to 127.0.0.1:port with standard local bypass
 func (m *Manager) Enable(httpPort int) error {
+	return m.EnableWithBypass(httpPort, nil)
+}
+
+// EnableWithBypass sets the Windows system proxy to 127.0.0.1:port and applies user bypass domains
+func (m *Manager) EnableWithBypass(httpPort int, bypassDomains []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -82,8 +181,10 @@ func (m *Manager) Enable(httpPort int) error {
 		return fmt.Errorf("setting ProxyEnable: %w", err)
 	}
 
-	// Bypass local addresses
-	_ = k.SetStringValue("ProxyOverride", "<local>;localhost;127.*;10.*;172.16.*;192.168.*")
+	overrideStr := BuildProxyOverride(bypassDomains)
+	if err := k.SetStringValue("ProxyOverride", overrideStr); err != nil {
+		return fmt.Errorf("setting ProxyOverride: %w", err)
+	}
 
 	m.notifyWinINet()
 	return nil

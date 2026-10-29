@@ -108,6 +108,32 @@ var FastlyCIDRs = []string{
 	"199.232.0.0/16",
 }
 
+// AkamaiCountryCIDRs provides verified Akamai edge subnets for targeted country scanning
+var AkamaiCountryCIDRs = map[string][]string{
+	"DE": {"184.24.77.0/24", "23.209.210.0/24", "23.213.161.0/24", "23.48.23.0/24", "23.207.210.0/24", "2.16.10.0/24", "72.246.28.0/24", "2.19.126.0/24", "23.2.13.0/24"},
+	"US": {"23.43.237.0/24", "72.18.63.0/24", "23.53.0.0/24", "23.57.0.0/24", "23.66.0.0/24", "23.52.0.0/24", "23.49.0.0/24", "23.67.0.0/24", "23.79.0.0/24", "184.24.0.0/24"},
+	"GB": {"92.16.53.0/24", "92.16.19.0/24", "95.101.0.0/24", "195.219.0.0/24", "2.24.0.0/24", "2.19.0.0/24", "2.18.100.0/24"},
+	"NL": {"2.23.0.0/24", "2.16.4.0/24", "2.16.24.0/24", "2.16.28.0/24", "2.16.40.0/24", "2.16.60.0/24"},
+	"FR": {"2.22.250.0/24", "23.58.193.0/24"},
+	"JP": {"23.56.0.0/24", "23.51.0.0/24"},
+	"CA": {"2.22.72.0/24", "23.33.24.0/24", "23.34.208.0/24", "23.34.212.0/24", "23.34.216.0/24"},
+	"SG": {"23.202.138.0/24", "23.44.0.0/24"},
+	"CH": {"2.16.12.0/24", "2.17.8.0/24", "2.19.64.0/24", "2.19.68.0/24", "2.19.72.0/24"},
+	"NO": {"2.18.172.0/24", "2.20.160.0/24", "2.20.164.0/24", "23.36.76.0/24", "23.44.32.0/24"},
+	"SE": {"23.54.0.0/24"},
+	"IT": {"2.18.0.0/24", "2.18.1.0/24"},
+	"ES": {"2.16.8.0/24", "2.16.64.0/24", "2.16.88.0/24", "2.16.224.0/24", "2.17.112.0/24"},
+	"AU": {"23.63.0.0/24", "23.55.0.0/24"},
+	"FI": {"2.20.0.0/24"},
+	"BE": {"2.17.196.0/24", "23.41.24.0/24", "23.55.96.0/24", "23.60.208.0/24", "23.60.212.0/24"},
+	"AT": {"2.16.16.0/24", "2.17.96.0/24", "2.17.244.0/24", "2.18.36.0/24", "2.18.68.0/24"},
+	"PL": {"2.16.172.0/24", "2.17.156.0/24", "2.17.240.0/24", "2.18.12.0/24", "2.21.40.0/24"},
+	"IE": {"2.17.172.0/24", "2.18.236.0/24", "2.19.60.0/24", "2.19.176.0/24", "23.38.172.0/24"},
+	"IN": {"95.100.0.0/24"},
+	"RO": {"92.123.102.0/24"},
+	"BR": {"104.112.146.0/24", "2.21.0.0/24", "88.221.0.0/24"},
+}
+
 // ShirOKhorshidCuratedIPs are proven pre-tested IPs for ShirOKhorshid / Psiphon CDN fronting (MCI, Irancell, Rightel, Shatel)
 var ShirOKhorshidCuratedIPs = []string{
 	"184.24.77.42",
@@ -145,6 +171,57 @@ var ShirOKhorshidCuratedIPs = []string{
 	"104.64.0.5",
 	"104.64.0.6",
 	"104.64.0.7",
+}
+
+// GetShiroKhorshidCuratedIPs returns a copy of vetted Akamai edge IPs for ShiroKhorshid fronting
+func GetShiroKhorshidCuratedIPs() []string {
+	out := make([]string, len(ShirOKhorshidCuratedIPs))
+	copy(out, ShirOKhorshidCuratedIPs)
+	return out
+}
+
+// GetTopFrontingEdges returns up to max alive CDN fronting edge IPs, prioritized by
+// lowest latency working nodes from the local database, with fallback to curated ShiroKhorshid IPs.
+func GetTopFrontingEdges(db *database.DB, max int) []string {
+	if max <= 0 {
+		max = 10
+	}
+	var edges []string
+	seen := make(map[string]bool)
+
+	if db != nil {
+		cfgs, _, err := db.GetConfigs(database.ConfigFilter{
+			Protocol:  "psiphon",
+			Status:    "working",
+			SortBy:    "latency",
+			SortOrder: "ASC",
+			Limit:     max * 2,
+		})
+		if err == nil {
+			for _, c := range cfgs {
+				ip := strings.TrimSpace(c.Server)
+				if ip != "" && ip != "direct" && ip != "auto" && !seen[ip] {
+					seen[ip] = true
+					edges = append(edges, ip)
+					if len(edges) >= max {
+						return edges
+					}
+				}
+			}
+		}
+	}
+
+	for _, ip := range ShirOKhorshidCuratedIPs {
+		if !seen[ip] {
+			seen[ip] = true
+			edges = append(edges, ip)
+			if len(edges) >= max {
+				break
+			}
+		}
+	}
+
+	return edges
 }
 
 // Official CDN IPv4 CIDR blocks commonly used for circumvention fronting (Cloudflare, Akamai, Fastly)
@@ -242,6 +319,7 @@ type ScanOptions struct {
 	CustomCIDRs []string `json:"custom_cidrs"` // optional custom CIDRs
 	Port        int      `json:"port"`         // default: 443
 	CDNTarget   string   `json:"cdn_target"`   // "akamai" (default), "cloudfront", "all", "cloudflare"
+	Country     string   `json:"country"`      // ISO country code e.g. "DE", "US", or ""/"AUTO"
 }
 
 
@@ -255,6 +333,7 @@ type Progress struct {
 	BestLatency int        `json:"best_latency"` // lowest latency in ms
 	CurrentIP   string     `json:"current_ip,omitempty"`
 	BestIPs     []IPResult `json:"best_ips"`
+	Country     string     `json:"country,omitempty"`
 	Message     string     `json:"message"`
 }
 
@@ -415,22 +494,54 @@ func (m *Manager) StartScan(opts ScanOptions) error {
 		target = "akamai"
 	}
 
-	candidates := GenerateCandidateIPsForTarget(target, opts.CustomCIDRs, opts.SampleSize)
+	targetCountry := strings.ToUpper(strings.TrimSpace(opts.Country))
+	if targetCountry == "AUTO" || targetCountry == "ANY" || targetCountry == "ALL" {
+		targetCountry = ""
+	}
+
+	geo := m.geo
+	if geo == nil {
+		geo = GetDefaultGeoResolver()
+	}
+
+	candidates := GenerateCandidateIPsForTargetAndCountry(target, opts.CustomCIDRs, opts.SampleSize, targetCountry, geo)
 	if len(candidates) == 0 {
+		if targetCountry != "" {
+			m.bestIPs = nil
+			m.isScanning = false
+			countryName := geoip.CountryName(targetCountry)
+			m.progress = Progress{
+				State:       "completed",
+				TotalIPs:    0,
+				TestedIPs:   0,
+				WorkingIPs:  0,
+				ProgressPct: 100,
+				BestLatency: 0,
+				BestIPs:     nil,
+				Country:     targetCountry,
+				Message:     fmt.Sprintf("هیچ آی‌پی تمیزی برای کشور %s یافت نشد.", countryName),
+			}
+			m.mu.Unlock()
+			return nil
+		}
 		m.mu.Unlock()
 		return fmt.Errorf("no valid IP candidates generated from CIDRs")
 	}
 
 	targetLabel := "Akamai (ShirOKhorshid & Global)"
-	switch strings.ToLower(target) {
-	case "akamai-eu", "akamai_eu":
-		targetLabel = "Akamai Europe"
-	case "cloudfront":
-		targetLabel = "Amazon CloudFront"
-	case "cloudflare":
-		targetLabel = "Cloudflare"
-	case "all":
-		targetLabel = "All CDNs"
+	if targetCountry != "" {
+		targetLabel = fmt.Sprintf("Akamai (%s - %s)", geoip.CountryName(targetCountry), targetCountry)
+	} else {
+		switch strings.ToLower(target) {
+		case "akamai-eu", "akamai_eu":
+			targetLabel = "Akamai Europe"
+		case "cloudfront":
+			targetLabel = "Amazon CloudFront"
+		case "cloudflare":
+			targetLabel = "Cloudflare"
+		case "all":
+			targetLabel = "All CDNs"
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -444,6 +555,8 @@ func (m *Manager) StartScan(opts ScanOptions) error {
 		WorkingIPs:  0,
 		ProgressPct: 0,
 		BestLatency: 0,
+		BestIPs:     nil,
+		Country:     targetCountry,
 		Message:     fmt.Sprintf("Testing %d %s edge IPs with %d workers...", len(candidates), targetLabel, opts.Workers),
 	}
 	m.mu.Unlock()
@@ -492,14 +605,29 @@ func (m *Manager) GetBestIPs(limit int) []IPResult {
 
 // runScan executes concurrent testing across workers
 func (m *Manager) runScan(ctx context.Context, candidates []candidateInfo, opts ScanOptions) {
+	targetCountry := strings.ToUpper(strings.TrimSpace(opts.Country))
+	if targetCountry == "AUTO" || targetCountry == "ANY" || targetCountry == "ALL" {
+		targetCountry = ""
+	}
+
 	defer func() {
 		m.mu.Lock()
 		m.isScanning = false
 		if m.progress.State == "scanning" {
 			m.progress.State = "completed"
 			m.progress.ProgressPct = 100
-			m.progress.Message = fmt.Sprintf("Completed. Found %d working Clean IPs (fastest: %d ms)",
-				m.progress.WorkingIPs, m.progress.BestLatency)
+			if targetCountry != "" {
+				m.progress.Country = targetCountry
+				if m.progress.WorkingIPs > 0 {
+					m.progress.Message = fmt.Sprintf("Completed. Found %d working Clean IPs for %s (fastest: %d ms)",
+						m.progress.WorkingIPs, geoip.CountryName(targetCountry), m.progress.BestLatency)
+				} else {
+					m.progress.Message = fmt.Sprintf("No working Clean IPs found for %s.", geoip.CountryName(targetCountry))
+				}
+			} else {
+				m.progress.Message = fmt.Sprintf("Completed. Found %d working Clean IPs (fastest: %d ms)",
+					m.progress.WorkingIPs, m.progress.BestLatency)
+			}
 		}
 		m.mu.Unlock()
 	}()
@@ -540,8 +668,6 @@ func (m *Manager) runScan(ctx context.Context, candidates []candidateInfo, opts 
 					tested := int(atomic.AddInt32(&testedCount, 1))
 
 					if err == nil && lat > 0 {
-						atomic.AddInt32(&workingCount, 1)
-
 						countryCode := "ANY"
 						countryName := c.CDN + " Edge (Anycast)"
 						if strings.Contains(strings.ToUpper(c.Subnet), "EU") || strings.Contains(strings.ToUpper(c.Subnet), "EUROPE") {
@@ -568,6 +694,18 @@ func (m *Manager) runScan(ctx context.Context, candidates []candidateInfo, opts 
 							}
 						}
 
+						// If targetCountry is set, filter out any IP not strictly belonging to targetCountry
+						if targetCountry != "" && countryCode != targetCountry {
+							goto progressCheck
+						}
+
+						atomic.AddInt32(&workingCount, 1)
+
+						if targetCountry != "" {
+							countryCode = targetCountry
+							countryName = geoip.CountryName(targetCountry)
+						}
+
 						res := IPResult{
 							IP:          c.IP,
 							Latency:     lat,
@@ -592,6 +730,7 @@ func (m *Manager) runScan(ctx context.Context, candidates []candidateInfo, opts 
 						resultsMu.Unlock()
 					}
 
+				progressCheck:
 					// Periodically update progress snapshot
 					if tested%5 == 0 || tested == total {
 						m.mu.Lock()
@@ -689,12 +828,25 @@ func sampleCIDRs(cidrs []string, count int, seen map[string]bool, cdnName, sni, 
 
 // GenerateCandidateIPsForTarget generates candidate IPs tailored to the specified CDN target
 func GenerateCandidateIPsForTarget(target string, customCIDRs []string, sampleSize int) []candidateInfo {
+	return GenerateCandidateIPsForTargetAndCountry(target, customCIDRs, sampleSize, "", GetDefaultGeoResolver())
+}
+
+// GenerateCandidateIPsForTargetAndCountry generates candidate IPs tailored to the specified CDN target and optional country
+func GenerateCandidateIPsForTargetAndCountry(target string, customCIDRs []string, sampleSize int, targetCountry string, geo *geoip.Resolver) []candidateInfo {
 	if sampleSize <= 0 {
 		sampleSize = 300
 	}
 	target = strings.ToLower(strings.TrimSpace(target))
 	if target == "" {
 		target = "akamai"
+	}
+	targetCountry = strings.ToUpper(strings.TrimSpace(targetCountry))
+	if targetCountry == "AUTO" || targetCountry == "ANY" || targetCountry == "ALL" {
+		targetCountry = ""
+	}
+
+	if geo == nil {
+		geo = GetDefaultGeoResolver()
 	}
 
 	var candidates []candidateInfo
@@ -713,6 +865,81 @@ func GenerateCandidateIPsForTarget(target string, customCIDRs []string, sampleSi
 		return candidates
 	}
 
+	// 1. Country-specific candidate generation
+	if targetCountry != "" {
+		countryName := geoip.CountryName(targetCountry)
+
+		// A. Curated IPs belonging to targetCountry
+		for _, ip := range ShirOKhorshidCuratedIPs {
+			if !seen[ip] && geo != nil {
+				g := geo.Lookup(ip)
+				if g.Code == targetCountry {
+					seen[ip] = true
+					candidates = append(candidates, candidateInfo{
+						IP:     ip,
+						Subnet: fmt.Sprintf("ShirOKhorshid / %s (%s)", countryName, targetCountry),
+						CDN:    "Akamai",
+						SNI:    "a248.e.akamai.net",
+						CDNSet: "psiphon-akamai",
+					})
+				}
+			}
+		}
+
+		// B. Target country CIDRs
+		var targetCIDRs []string
+		if cidrs, ok := AkamaiCountryCIDRs[targetCountry]; ok && len(cidrs) > 0 {
+			targetCIDRs = append(targetCIDRs, cidrs...)
+		}
+
+		if geo != nil {
+			for _, cidr := range append(AkamaiCIDRs, AkamaiEUCIDRs...) {
+				prefix := strings.Split(cidr, "/")[0]
+				if geo.Lookup(prefix).Code == targetCountry {
+					found := false
+					for _, tc := range targetCIDRs {
+						if tc == cidr {
+							found = true
+							break
+						}
+					}
+					if !found {
+						targetCIDRs = append(targetCIDRs, cidr)
+					}
+				}
+			}
+		}
+
+		if len(targetCIDRs) > 0 {
+			rem := sampleSize - len(candidates)
+			if rem > 0 {
+				sampled := sampleCIDRs(targetCIDRs, rem*3, seen, "Akamai", "a248.e.akamai.net", "psiphon-akamai", fmt.Sprintf("Akamai %s Edge", countryName), rng)
+				for _, c := range sampled {
+					if geo != nil {
+						g := geo.Lookup(c.IP)
+						if g.Code != targetCountry {
+							continue
+						}
+					}
+					candidates = append(candidates, c)
+					if len(candidates) >= sampleSize {
+						break
+					}
+				}
+			}
+		}
+
+		rng.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
+
+		if len(candidates) > sampleSize {
+			candidates = candidates[:sampleSize]
+		}
+		return candidates
+	}
+
+	// 2. Global / Auto candidate generation (targetCountry == "")
 	switch target {
 	case "akamai-eu", "akamai_eu":
 		// European curated IPs
@@ -1187,16 +1414,9 @@ func CreateOrUpdateCleanIPNodeWithRegion(db *database.DB, cleanIP string, latenc
 		}
 	}
 
-	if egressRegion != "" {
-		countryCode = egressRegion
-		countryName = geoip.CountryName(egressRegion)
-	}
-
 	nodeName := strings.TrimSpace(customName)
 	if nodeName == "" {
-		if egressRegion != "" {
-			nodeName = fmt.Sprintf("%s CDN | %s (%s)", cdnName, cleanIP, countryName)
-		} else if countryCode != "" && countryCode != "ANY" && countryCode != "CF" && countryCode != "UN" {
+		if countryCode != "" && countryCode != "ANY" && countryCode != "CF" && countryCode != "UN" {
 			nodeName = fmt.Sprintf("%s CDN | %s (%s)", cdnName, cleanIP, countryName)
 		} else {
 			nodeName = fmt.Sprintf("%s CDN | %s", cdnName, cleanIP)

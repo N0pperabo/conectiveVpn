@@ -38,6 +38,13 @@
         <button id="btnCleanIP" class="btn btn-secondary" title="Akamai Clean IP & CDN Fronting Scanner">
           CDN Clean IP
         </button>
+        <button id="btnMHR" class="btn btn-secondary" title="Master HTTP Relay (Google Apps Script & Cloudflare Workers)">
+          MHR Relay
+        </button>
+        <button id="btnSniSpoof" class="btn btn-secondary" title="SNI Spoofing (DPI Circumvention)">
+          SNI Spoof
+          <span id="badgeSniSpoofTop" class="badge-mini" style="display: none; background: #a855f7; color: #fff; font-size: 10px; padding: 1px 5px; border-radius: 4px; margin-left: 4px;">ON</span>
+        </button>
         <button id="btnLogs" class="btn btn-secondary" title="View live system and circumvention engine logs">
           Logs
         </button>
@@ -91,6 +98,8 @@
             <span class="sysproxy-badge" id="badgeSysProxy">System Proxy: ON</span>
             <span class="tun-status-badge" id="badgeTunStatus" style="display: none;">TUN VPN: ACTIVE</span>
             <span class="lan-status-badge" id="badgeLanStatus" style="display: none;">LAN SHARE</span>
+            <span class="sysproxy-badge" id="badgeMhrActive" style="display: none; background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(96, 165, 250, 0.3);">MHR: ACTIVE</span>
+            <span class="sysproxy-badge" id="badgeSniSpoofActive" style="display: none; background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(192, 132, 252, 0.3);">SNI SPOOF: ACTIVE</span>
           </div>
         </div>
         <button id="btnConnect" class="btn btn-connect" disabled>CONNECT</button>
@@ -773,7 +782,7 @@
               </select>
             </div>
             <div class="form-group" style="flex: 1.2;">
-              <label>کشور خروجی (Exit Country)</label>
+              <label>کشور اتصال و اسکن (Country / Region)</label>
               <select id="cleanIPEgressRegion">
                 <option value="" selected>خودکار (سریع‌ترین سرور - Auto / Best)</option>
                 <option value="DE">آلمان - Germany (DE)</option>
@@ -796,6 +805,8 @@
                 <option value="PL">لهستان - Poland (PL)</option>
                 <option value="IE">ایرلند - Ireland (IE)</option>
                 <option value="IN">هند - India (IN)</option>
+                <option value="RO">رومانی - Romania (RO)</option>
+                <option value="BR">برزیل - Brazil (BR)</option>
               </select>
             </div>
             <div class="form-group" style="flex: 0.8;">
@@ -917,6 +928,195 @@
     </div>
   </div>
 
+  <!-- Modal: MHR Relay (Master HTTP Relay - Google Apps Script & Cloudflare Workers) -->
+  <div id="mhrModal" class="modal">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <h3>Master HTTP Relay (MHR & MHR-CFW)</h3>
+          <span id="mhrStatusPill" class="badge" style="background: rgba(148, 163, 184, 0.2); color: #94a3b8; font-size: 11px; padding: 3px 8px; border-radius: 4px;">STOPPED</span>
+        </div>
+        <button class="modal-close" data-close="mhrModal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <p class="modal-desc" style="direction: rtl; text-align: right; line-height: 1.6; font-size: 13px;">
+          تونل ضد فیلترینگ بر بستر Google Apps Script و ورکر کلودفلر با فرانتینگ دامنه گوگل. ترافیک کلاینت در بستر TLS گوگل به سرورهای کلود منتقل و فیلترینگ شدید را دور می‌زند.
+        </p>
+
+        <!-- Top Live Status & Control Bar -->
+        <div class="cleanip-controls-box" style="margin-bottom: 16px; padding: 14px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">State</span>
+                <b id="mhrStatusText" style="color: #94a3b8; font-size: 13px;">Stopped</b>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Ports</span>
+                <span style="font-family: monospace; font-size: 12px;">HTTP: <b id="mhrLblHttpPort">8085</b> | SOCKS5: <b id="mhrLblSocksPort">1080</b></span>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Latency</span>
+                <b id="mhrLblLatency" style="color: #10b981; font-size: 13px;">-- ms</b>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Exit IP</span>
+                <span id="mhrLblExitIP" style="font-family: monospace; font-size: 12px; color: #93c5fd;">--</span>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <button type="button" id="btnMHRTest" class="btn btn-secondary btn-sm" disabled title="Test connectivity through MHR relay">
+                Test Ping
+              </button>
+              <button type="button" id="btnMHRStop" class="btn btn-danger btn-sm" style="display: none;">
+                Stop Relay
+              </button>
+              <button type="button" id="btnMHRStart" class="btn btn-primary btn-sm btn-glow">
+                Start Relay
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- MHR Configuration Form -->
+        <form id="mhrConfigForm">
+          <div class="form-row">
+            <div class="form-group" style="flex: 1;">
+              <label>Relay Variant</label>
+              <select id="mhrVariant">
+                <option value="mhr" selected>MHR (Standard Google Apps Script Relay)</option>
+                <option value="mhr-cfw">MHR-CFW (GAS + Cloudflare Worker Exit)</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex: 1.5;">
+              <label>Apps Script Deployment ID <span style="color: var(--text-muted); font-size: 11px;">(Required)</span></label>
+              <input type="text" id="mhrScriptId" placeholder="AKfycbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..." required>
+            </div>
+            <div class="form-group" style="flex: 1.2;">
+              <label>AUTH_KEY <span style="color: var(--text-muted); font-size: 11px;">(Secret Key)</span></label>
+              <div style="display: flex; gap: 4px;">
+                <input type="password" id="mhrAuthKey" placeholder="Your strong secret password" required style="flex: 1;">
+                <button type="button" id="btnToggleMhrAuth" class="btn btn-secondary btn-sm" style="padding: 0 10px;">Show</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-row" style="margin-top: 10px;">
+            <div class="form-group" style="flex: 1.2;">
+              <label>Google Fronting IP</label>
+              <div style="display: flex; gap: 6px;">
+                <input type="text" id="mhrGoogleIP" value="216.239.38.120" placeholder="216.239.38.120" style="flex: 1;">
+                <button type="button" id="btnMHRScanGoogleIP" class="btn btn-secondary btn-sm" title="Scan candidate Google IPs to find the lowest latency">
+                  Scan Clean IP
+                </button>
+              </div>
+            </div>
+            <div class="form-group" style="flex: 1;">
+              <label>Front Domain</label>
+              <input type="text" id="mhrFrontDomain" value="www.google.com" placeholder="www.google.com">
+            </div>
+            <div class="form-group" style="flex: 0.8;">
+              <label>HTTP Port</label>
+              <input type="number" id="mhrHttpPort" value="8085" min="1" max="65535">
+            </div>
+            <div class="form-group" style="flex: 0.8;">
+              <label>SOCKS5 Port</label>
+              <input type="number" id="mhrSocks5Port" value="1080" min="1" max="65535">
+            </div>
+          </div>
+
+          <!-- CFW Worker URL (shown for mhr-cfw) -->
+          <div id="mhrCFWBox" class="form-row" style="margin-top: 10px; display: none;">
+            <div class="form-group" style="flex: 1;">
+              <label>Cloudflare Worker URL <span style="color: var(--text-muted); font-size: 11px;">(Configured in Code.gs for MHR-CFW)</span></label>
+              <input type="text" id="mhrWorkerURL" placeholder="https://myworker.yourname.workers.dev">
+            </div>
+          </div>
+
+          <!-- Options Row: System Proxy & LAN Sharing & Certificate Management -->
+          <div style="margin-top: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 14px; background: rgba(255, 255, 255, 0.02); border-radius: 6px; border: 1px solid var(--border-color);">
+            <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
+              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px;">
+                <input type="checkbox" id="mhrChkSystemProxy" checked>
+                <span>Route Windows System Traffic (Set System Proxy)</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px;">
+                <input type="checkbox" id="mhrChkLANSharing">
+                <span>Share with Local Network (LAN Sharing 0.0.0.0)</span>
+              </label>
+            </div>
+
+            <div style="display: flex; gap: 8px;">
+              <button type="button" id="btnMHRInstallCA" class="btn btn-secondary btn-sm" title="Install MHR Root CA into Windows certificate store for transparent HTTPS interception">
+                Install Root CA
+              </button>
+              <button type="button" id="btnMHRUninstallCA" class="btn btn-outline-danger btn-sm" title="Remove MHR Root CA from Windows certificate store">
+                Remove Root CA
+              </button>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
+            <div style="font-size: 12px; color: var(--text-muted);">
+              Changes to credentials and ports require saving and restarting the relay.
+            </div>
+            <button type="submit" class="btn btn-primary">
+              Save Configuration
+            </button>
+          </div>
+        </form>
+
+        <!-- Scanner Results Banner (Collapsible) -->
+        <div id="mhrScannerBox" style="display: none; margin-top: 16px; padding: 12px; background: rgba(0, 0, 0, 0.2); border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <b style="font-size: 13px;">Google Fronting IPs Scanner Results</b>
+            <button type="button" id="btnCloseMhrScanner" class="btn btn-secondary btn-sm">Close Scanner</button>
+          </div>
+          <div style="max-height: 180px; overflow-y: auto;">
+            <table class="nodes-table" style="font-size: 12px;">
+              <thead>
+                <tr>
+                  <th width="40">#</th>
+                  <th>Google IP</th>
+                  <th>Latency</th>
+                  <th>Status</th>
+                  <th width="80">Action</th>
+                </tr>
+              </thead>
+              <tbody id="mhrScannerTableBody">
+                <tr><td colspan="5" style="text-align:center; padding:12px; color:var(--text-muted);">Click 'Scan Clean IP' to test reachable Google edge IPs.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Cloud Deployment Scripts Section -->
+        <div style="margin-top: 18px; border-top: 1px solid var(--border-color); padding-top: 14px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <h4 style="font-size: 13px; font-weight: 600;">Cloud Relay Deployment Scripts</h4>
+            <div style="display: flex; gap: 8px;">
+              <button type="button" id="btnCopyAppsScript" class="btn btn-secondary btn-sm" title="Copy Google Apps Script Code.gs pre-filled with your AUTH_KEY">
+                Copy Code.gs (Apps Script)
+              </button>
+              <button type="button" id="btnCopyWorkerScript" class="btn btn-secondary btn-sm" title="Copy Cloudflare Worker worker.js">
+                Copy worker.js (Cloudflare)
+              </button>
+            </div>
+          </div>
+          <div style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+            1. Open <a href="https://script.google.com/" target="_blank" style="color: #60a5fa; text-decoration: underline;">Google Apps Script</a>, create a New project, paste <b>Code.gs</b>.<br>
+            2. Click <b>Deploy &rarr; New deployment &rarr; Web app</b> (Execute as: <i>Me</i>, Who has access: <i>Anyone</i>).<br>
+            3. Copy the resulting <b>Deployment ID</b> and paste it into the field above.<br>
+            4. For MHR-CFW mode, deploy <b>worker.js</b> to Cloudflare Workers and update <code>WORKER_URL</code> in your Code.gs.
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
   <!-- Modal: Visual App Picker for Split Tunneling -->
   <div id="appPickerModal" class="modal">
     <div class="modal-content modal-lg app-picker-modal">
@@ -1026,6 +1226,112 @@
   <div id="toastContainer" class="toast-container"></div>
 
   <script src="app.js"></script>
+
+  <!-- Modal: SNI Spoofing (DPI Circumvention) -->
+  <div id="sniSpoofModal" class="modal">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <h3>SNI Spoofing (DPI Circumvention)</h3>
+          <span id="sniSpoofStatusPill" class="badge" style="background: rgba(148, 163, 184, 0.2); color: #94a3b8; font-size: 11px; padding: 3px 8px; border-radius: 4px;">STOPPED</span>
+        </div>
+        <button class="modal-close" data-close="sniSpoofModal">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <p class="modal-desc" style="direction: rtl; text-align: right; line-height: 1.6; font-size: 13px;">
+          دور زدن فیلترینگ شدید TLS/SNI با تزریق پکت‌های تقلبی ClientHello با شماره توالی خارج از بازه (Out-of-Window). فایروال سانسورچی با مشاهده دامنه مجاز ارتباط را تایید کرده و ترافیک واقعی به سرور منتقل می‌شود.
+        </p>
+
+        <!-- Top Live Status & Control Bar -->
+        <div class="cleanip-controls-box" style="margin-bottom: 16px; padding: 14px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">State</span>
+                <b id="sniSpoofStatusText" style="color: #94a3b8; font-size: 13px;">Stopped</b>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Engine</span>
+                <span id="sniSpoofActiveEngineText" style="font-family: monospace; font-size: 12px; color: #a855f7;">Auto / Binary</span>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Listener Port</span>
+                <span style="font-family: monospace; font-size: 12px;">127.0.0.1:<b id="sniSpoofLblListenPort">40443</b></span>
+              </div>
+              <div>
+                <span style="font-size: 11px; color: var(--text-muted); display: block;">Target Destination</span>
+                <span id="sniSpoofLblTarget" style="font-family: monospace; font-size: 12px; color: #e2e8f0;">Auto (Active Node)</span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button type="button" id="btnToggleSniSpoof" class="btn btn-primary btn-sm">Enable SNI Spoof</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Configuration Form -->
+        <form id="sniSpoofForm">
+          <div class="form-check" style="margin-bottom: 14px;">
+            <label>
+              <input type="checkbox" id="chkSniSpoofEnabled">
+              <b>Enable SNI Spoofing for Standard Nodes</b> - Automatically applies to VLESS, VMess, Trojan, and SS connections
+            </label>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group" style="flex: 1;">
+              <label>Engine Backend</label>
+              <select id="selSniSpoofEngine">
+                <option value="auto" selected>Auto (Recommended - Best Available)</option>
+                <option value="binary">Standalone Binary (sni-spoofing.exe)</option>
+                <option value="rust">Rust Engine (sni-spoof-rs.exe)</option>
+                <option value="python">Python Runtime (main.py)</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex: 1;">
+              <label>Local Listener Port</label>
+              <input type="number" id="txtSniSpoofListenPort" value="40443" min="1024" max="65535">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Fake SNI Domain (Whitelisted Domain for Handshake Spoofing)</label>
+            <input type="text" id="txtSniSpoofFakeSNI" value="auth.vercel.com" placeholder="auth.vercel.com">
+            <div style="display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap;">
+              <span style="font-size: 11px; color: var(--text-muted); align-self: center;">Presets:</span>
+              <button type="button" class="btn btn-xs btn-secondary btn-sni-preset" data-sni="auth.vercel.com">auth.vercel.com</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-sni-preset" data-sni="mci.ir">mci.ir</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-sni-preset" data-sni="speedtest.net">speedtest.net</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-sni-preset" data-sni="sentry.io">sentry.io</button>
+              <button type="button" class="btn btn-xs btn-secondary btn-sni-preset" data-sni="api.github.com">api.github.com</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group" style="flex: 2;">
+              <label>Target Connect IP Override (Optional)</label>
+              <input type="text" id="txtSniSpoofConnectIP" placeholder="Leave blank to auto-resolve from selected node">
+            </div>
+            <div class="form-group" style="flex: 1;">
+              <label>Target Port Override</label>
+              <input type="number" id="txtSniSpoofConnectPort" placeholder="Default: 443" min="1" max="65535">
+            </div>
+          </div>
+
+          <div style="margin-top: 14px; padding: 10px; background: rgba(168, 85, 247, 0.06); border: 1px solid rgba(168, 85, 247, 0.2); border-radius: 6px; font-size: 12px; line-height: 1.5; color: #cbd5e1;">
+            <b>Compatibility Notice:</b> SNI Spoofing requires Administrator privileges for WinDivert. When connecting to <b>Psiphon</b> or <b>Clean IP</b> fronting nodes, SNI Spoofing is safely paused automatically to ensure optimal CDN routing without interference.
+          </div>
+
+          <div class="modal-actions" style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+            <button type="button" class="btn btn-secondary btn-sm" data-close="sniSpoofModal">Close</button>
+            <button type="submit" class="btn btn-primary btn-sm">Save SNI Spoof Settings</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
 </body>
 </html>
 

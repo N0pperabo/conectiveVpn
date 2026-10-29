@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	"freenode/pkg/logger"
 	"freenode/pkg/models"
 	"freenode/pkg/psiphon"
+	"freenode/pkg/snispoof"
 	"freenode/pkg/tun"
 	"freenode/pkg/v2go"
 )
@@ -50,6 +52,19 @@ type Runner struct {
 	shareLAN          bool
 	gamingMode        bool
 	db                *database.DB
+	sniSpoofMgr       *snispoof.Manager
+}
+
+func (r *Runner) SetSNISpoofManager(mgr *snispoof.Manager) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sniSpoofMgr = mgr
+}
+
+func (r *Runner) GetSNISpoofManager() *snispoof.Manager {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sniSpoofMgr
 }
 
 func (r *Runner) SetDB(db *database.DB) {
@@ -166,6 +181,10 @@ func (r *Runner) GetStatus() models.ConnectionStatus {
 		status.ConnectedSince = &r.connectedAt
 	}
 
+	if r.sniSpoofMgr != nil && r.sniSpoofMgr.IsRunning() {
+		status.SniSpoofMode = true
+	}
+
 	return status
 }
 
@@ -208,6 +227,9 @@ func (r *Runner) Connect(node *models.Config) error {
 		if r.psiphonRunner != nil {
 			_ = r.psiphonRunner.Stop()
 		}
+		if r.sniSpoofMgr != nil && r.sniSpoofMgr.IsRunning() {
+			_ = r.sniSpoofMgr.Stop()
+		}
 
 		preferredSocks := r.baseSocksPort
 		if preferredSocks <= 0 {
@@ -244,25 +266,25 @@ func (r *Runner) Connect(node *models.Config) error {
 		egressRegion := ""
 		if node.RawLink != "" {
 			if u, err := url.Parse(node.RawLink); err == nil {
-				if reg := u.Query().Get("region"); reg != "" {
+				if reg := u.Query().Get("region"); reg != "" && reg != "AUTO" && reg != "ANY" {
 					egressRegion = strings.ToUpper(strings.TrimSpace(reg))
 				}
 			}
 		}
 
-		if egressRegion == "" || egressRegion == "AUTO" || egressRegion == "ANY" {
-			countryCandidate := strings.TrimSpace(strings.ToUpper(node.Country))
-			if len(countryCandidate) == 2 && countryCandidate != "CF" && countryCandidate != "IR" && countryCandidate != "UN" && countryCandidate != "WW" {
-				egressRegion = countryCandidate
-			} else {
-				egressRegion = ""
+		// Check user's preferred egress region setting first
+		if egressRegion == "" && r.db != nil {
+			dbRegion := strings.TrimSpace(strings.ToUpper(r.db.GetSetting("psiphon_region", "")))
+			if dbRegion != "" && dbRegion != "AUTO" && dbRegion != "ANY" && dbRegion != "ALL" {
+				egressRegion = dbRegion
 			}
 		}
 
-		if egressRegion == "" && r.db != nil {
-			dbRegion := strings.TrimSpace(strings.ToUpper(r.db.GetSetting("psiphon_region", "")))
-			if dbRegion != "AUTO" && dbRegion != "ANY" {
-				egressRegion = dbRegion
+		// Only fallback to node.Country if it's a named country node (not a generic CDN edge IP)
+		if egressRegion == "" && !node.IsCDNIP() && node.Source != "Clean IP Fronting" && !strings.Contains(strings.ToLower(node.Tags), "cdn") {
+			countryCandidate := strings.TrimSpace(strings.ToUpper(node.Country))
+			if len(countryCandidate) == 2 && countryCandidate != "CF" && countryCandidate != "IR" && countryCandidate != "UN" && countryCandidate != "WW" {
+				egressRegion = countryCandidate
 			}
 		}
 
@@ -520,6 +542,72 @@ func (r *Runner) Connect(node *models.Config) error {
 		return fmt.Errorf("converting node outbound: %w", err)
 	}
 
+	// SNI Spoofing DPI bypass interception
+	useSniSpoof := false
+	sniSpoofTargetIP := ""
+	r.mu.RLock()
+	sniMgr := r.sniSpoofMgr
+	r.mu.RUnlock()
+
+	if sniMgr != nil {
+		if r.db != nil && r.db.GetSetting("sni_spoof_enabled", "false") == "true" {
+			useSniSpoof = true
+		} else if sniMgr.IsEnabled() {
+			useSniSpoof = true
+		}
+	}
+
+	if useSniSpoof {
+		if !tun.IsAdmin() {
+			return fmt.Errorf("SNI Spoofing requires Administrator privileges to load the WinDivert filter driver")
+		}
+
+		targetHost := node.Server
+		if r.db != nil {
+			if ipOverride := strings.TrimSpace(r.db.GetSetting("sni_spoof_connect_ip", "")); ipOverride != "" {
+				targetHost = ipOverride
+			}
+		}
+
+		targetPort := node.Port
+		if r.db != nil {
+			if p, err := strconv.Atoi(r.db.GetSetting("sni_spoof_connect_port", "")); err == nil && p > 0 {
+				targetPort = p
+			}
+		}
+
+		fakeSNI := "auth.vercel.com"
+		if r.db != nil {
+			if s := strings.TrimSpace(r.db.GetSetting("sni_spoof_fake_sni", "")); s != "" {
+				fakeSNI = s
+			}
+		}
+
+		if err := sniMgr.Start(targetHost, targetPort, fakeSNI, node.ID, node.Name); err != nil {
+			logger.Error("xray", "Failed to start SNI Spoofing forwarder: %v", err)
+			return fmt.Errorf("starting SNI Spoofing forwarder: %w", err)
+		}
+
+		status := sniMgr.GetStatus()
+		sniSpoofTargetIP = status.TargetIP
+		listenHost, listenPort := sniMgr.GetListenAddress()
+
+		// Rewrite outbound address & port to local SNI Spoof listener
+		if settings, ok := outbound["settings"].(v2go.M); ok && settings != nil {
+			if vnext, ok := settings["vnext"].([]v2go.M); ok && len(vnext) > 0 {
+				vnext[0]["address"] = listenHost
+				vnext[0]["port"] = listenPort
+			} else if servers, ok := settings["servers"].([]v2go.M); ok && len(servers) > 0 {
+				servers[0]["address"] = listenHost
+				servers[0]["port"] = listenPort
+			}
+		}
+		logger.Info("xray", "Outbound routed through SNI Spoofing (%s:%d -> %s:%d, fake SNI: %s)",
+			listenHost, listenPort, sniSpoofTargetIP, targetPort, fakeSNI)
+	} else if sniMgr != nil && sniMgr.IsRunning() {
+		_ = sniMgr.Stop()
+	}
+
 	// Configure stream sockopt
 	streamSettings, ok := outbound["streamSettings"].(v2go.M)
 	if !ok || streamSettings == nil {
@@ -539,7 +627,8 @@ func (r *Runner) Connect(node *models.Config) error {
 		if physIface == "" {
 			_, physIface, _ = tun.FindPhysicalGatewayAndInterface()
 		}
-		if physIface != "" {
+		isLoopback := node.Server == "127.0.0.1" || strings.HasPrefix(node.Server, "127.") || strings.EqualFold(node.Server, "localhost")
+		if physIface != "" && !isLoopback {
 			sockopt["interface"] = physIface
 		}
 	}
@@ -584,6 +673,7 @@ func (r *Runner) Connect(node *models.Config) error {
 			"sniffing": v2go.M{
 				"enabled":      true,
 				"destOverride": []string{"http", "tls"},
+				"routeOnly":    false,
 			},
 		},
 		{
@@ -593,6 +683,11 @@ func (r *Runner) Connect(node *models.Config) error {
 			"protocol": "http",
 			"settings": v2go.M{
 				"allowTransparent": false,
+			},
+			"sniffing": v2go.M{
+				"enabled":      true,
+				"destOverride": []string{"http", "tls"},
+				"routeOnly":    false,
 			},
 		},
 	}
@@ -741,6 +836,9 @@ func (r *Runner) Connect(node *models.Config) error {
 	// If TUN mode is enabled, set up adapter IP and routing
 	if tunEnabled {
 		serverHost := strings.TrimSpace(node.Server)
+		if useSniSpoof && sniSpoofTargetIP != "" {
+			serverHost = sniSpoofTargetIP
+		}
 		if strings.EqualFold(serverHost, "direct") || strings.EqualFold(serverHost, "auto") {
 			serverHost = ""
 		}
@@ -748,6 +846,9 @@ func (r *Runner) Connect(node *models.Config) error {
 		if err := r.tunMgr.SetupAdapter(tunAdapterName, serverHost); err != nil {
 			logger.Error("tun", "Failed to setup TUN adapter: %v", err)
 			_ = instance.Close()
+			if useSniSpoof && sniMgr != nil {
+				_ = sniMgr.Stop()
+			}
 			_ = tun.ResetOrRemoveAdapter(tunAdapterName)
 			return fmt.Errorf("failed setting up TUN routes: %w", err)
 		}
@@ -842,6 +943,10 @@ func (r *Runner) Disconnect() (err error) {
 		r.activeNode = nil
 		r.lastLatency = 0
 		r.exitIP = ""
+	}
+
+	if r.sniSpoofMgr != nil && r.sniSpoofMgr.IsRunning() {
+		_ = r.sniSpoofMgr.Stop()
 	}
 
 	return err
@@ -1025,12 +1130,128 @@ func isPortFree(port int) bool {
 	return true
 }
 
-func parseLines(text string) []string {
-	var list []string
+func cleanRoutingRules(text string) (domains []string, ips []string) {
+	seenDomains := make(map[string]bool)
+	seenIPs := make(map[string]bool)
+
 	for _, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-			list = append(list, trimmed)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Keep explicit special prefixes as-is
+		if strings.HasPrefix(trimmed, "geosite:") || strings.HasPrefix(trimmed, "ext:") ||
+			strings.HasPrefix(trimmed, "full:") || strings.HasPrefix(trimmed, "keyword:") {
+			if !seenDomains[trimmed] {
+				seenDomains[trimmed] = true
+				domains = append(domains, trimmed)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "regexp:") {
+			if !seenDomains[trimmed] {
+				seenDomains[trimmed] = true
+				domains = append(domains, trimmed)
+			}
+			// If it's the Iranian TLD regex, also guarantee native domain:ir is present
+			if strings.Contains(trimmed, ".ir$") && !seenDomains["domain:ir"] {
+				seenDomains["domain:ir"] = true
+				domains = append(domains, "domain:ir")
+			}
+			continue
+		}
+
+		// Strip protocol
+		if idx := strings.Index(trimmed, "://"); idx != -1 {
+			trimmed = trimmed[idx+3:]
+		}
+		// Strip path, query, hash
+		if idx := strings.IndexAny(trimmed, "/?#"); idx != -1 {
+			trimmed = trimmed[:idx]
+		}
+		// Strip port if single colon (not IPv6)
+		if !strings.Contains(trimmed, "]") && strings.Count(trimmed, ":") == 1 {
+			if h, _, err := net.SplitHostPort(trimmed); err == nil {
+				trimmed = h
+			}
+		}
+
+		trimmed = strings.ToLower(strings.TrimSpace(trimmed))
+		if trimmed == "" {
+			continue
+		}
+
+		// Check if it's an IP address or CIDR
+		if ip := net.ParseIP(trimmed); ip != nil {
+			if !seenIPs[trimmed] {
+				seenIPs[trimmed] = true
+				ips = append(ips, trimmed)
+			}
+			continue
+		}
+		if _, _, err := net.ParseCIDR(trimmed); err == nil {
+			if !seenIPs[trimmed] {
+				seenIPs[trimmed] = true
+				ips = append(ips, trimmed)
+			}
+			continue
+		}
+
+		// If wildcard prefix like *.example.com or .example.com
+		trimmed = strings.TrimPrefix(trimmed, "*.")
+		trimmed = strings.TrimPrefix(trimmed, ".")
+		trimmed = strings.TrimPrefix(trimmed, "domain:")
+
+		if trimmed == "ir" {
+			if !seenDomains["domain:ir"] {
+				seenDomains["domain:ir"] = true
+				domains = append(domains, "domain:ir")
+			}
+			continue
+		}
+
+		rule := "domain:" + trimmed
+		if !seenDomains[rule] {
+			seenDomains[rule] = true
+			domains = append(domains, rule)
+		}
+	}
+	return domains, ips
+}
+
+func cleanProcessRules(text string) []string {
+	seen := make(map[string]bool)
+	var list []string
+
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		base := filepath.Base(trimmed)
+		lower := strings.ToLower(base)
+		noExe := strings.TrimSuffix(lower, ".exe")
+
+		candidates := []string{
+			lower,
+			noExe,
+			noExe + ".exe",
+			strings.Title(noExe),
+			strings.Title(noExe) + ".exe",
+			strings.ToUpper(noExe),
+			strings.ToUpper(noExe) + ".EXE",
+			trimmed,
+		}
+
+		for _, cand := range candidates {
+			cand = strings.TrimSpace(cand)
+			if cand != "" && !seen[cand] {
+				seen[cand] = true
+				list = append(list, cand)
+			}
 		}
 	}
 	return list
@@ -1048,7 +1269,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 		lanIPs = append(lanIPs, "224.0.0.0/4", "255.255.255.255/32")
 	}
 
-	// Base rule: Local LAN and private subnets always route Direct
+	// Base rules: LAN and core binaries always Direct
 	rules := []v2go.M{
 		{
 			"type":        "field",
@@ -1057,14 +1278,8 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 		},
 		{
 			"type":        "field",
-			"process":     []string{"psiphon-tunnel-core.exe", "aether.exe"},
+			"process":     cleanProcessRules("psiphon-tunnel-core.exe\naether.exe\nconective.exe"),
 			"outboundTag": "direct",
-		},
-		{
-			"type":        "field",
-			"port":        "443",
-			"network":     "udp",
-			"outboundTag": "block",
 		},
 	}
 
@@ -1087,24 +1302,59 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 		routingMode = "whitelist"
 	}
 
-	directDomains := parseLines(r.db.GetSetting("direct_domains", ""))
-	directApps := parseLines(r.db.GetSetting("direct_apps", ""))
-	proxyDomains := parseLines(r.db.GetSetting("proxy_domains", ""))
-	proxyApps := parseLines(r.db.GetSetting("proxy_apps", ""))
-	blockDomains := parseLines(r.db.GetSetting("block_domains", ""))
+	defaultDirectDomains := "domain:ir\nregexp:.*\\.ir$\nshaparak.ir\ndigikala.com\ndivar.ir\nsnapp.ir\ntorob.com\nvarzesh3.com\ntelewebion.com\nbale.ai\neitaa.com\nrubika.ir\naparat.com\nfilimo.com"
+	defaultProxyDomains := "google.com\nyoutube.com\ntwitter.com\nx.com\nt.me\ntelegram.org\ninstagram.com\nfacebook.com\ndiscord.com"
+	defaultDirectApps := "cs2.exe\nvalorant.exe\ndota2.exe\nleagueclient.exe\nidman.exe"
+	defaultProxyApps := "telegram.exe\ndiscord.exe\nchrome.exe\nmsedge.exe\nfirefox.exe\nspotify.exe"
 
-	// 1. Blocked Domains (if specified)
-	if len(blockDomains) > 0 {
-		rules = append(rules, v2go.M{
-			"type":        "field",
-			"domain":      blockDomains,
-			"outboundTag": "block",
-		})
+	directDomainsRaw := r.db.GetSetting("direct_domains", defaultDirectDomains)
+	if directDomainsRaw == "" {
+		directDomainsRaw = defaultDirectDomains
 	}
+	directAppsRaw := r.db.GetSetting("direct_apps", defaultDirectApps)
+	if directAppsRaw == "" {
+		directAppsRaw = defaultDirectApps
+	}
+	proxyDomainsRaw := r.db.GetSetting("proxy_domains", defaultProxyDomains)
+	if proxyDomainsRaw == "" {
+		proxyDomainsRaw = defaultProxyDomains
+	}
+	proxyAppsRaw := r.db.GetSetting("proxy_apps", defaultProxyApps)
+	if proxyAppsRaw == "" {
+		proxyAppsRaw = defaultProxyApps
+	}
+	blockDomainsRaw := r.db.GetSetting("block_domains", "")
+
+	directDomains, directIPs := cleanRoutingRules(directDomainsRaw)
+	directApps := cleanProcessRules(directAppsRaw)
+	proxyDomains, proxyIPs := cleanRoutingRules(proxyDomainsRaw)
+	proxyApps := cleanProcessRules(proxyAppsRaw)
+	blockDomains, blockIPs := cleanRoutingRules(blockDomainsRaw)
 
 	switch routingMode {
 	case "proxy_all":
-		// Gaming mode: prioritize UDP traffic on fast path
+		if len(blockDomains) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"domain":      blockDomains,
+				"outboundTag": "block",
+			})
+		}
+		if len(blockIPs) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"ip":          blockIPs,
+				"outboundTag": "block",
+			})
+		}
+
+		rules = append(rules, v2go.M{
+			"type":        "field",
+			"port":        "443",
+			"network":     "udp",
+			"outboundTag": "block",
+		})
+
 		if gamingMode {
 			rules = append(rules, v2go.M{
 				"type":        "field",
@@ -1112,7 +1362,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 				"outboundTag": "proxy",
 			})
 		}
-		// All non-LAN traffic passes through proxy
+
 		rules = append(rules, v2go.M{
 			"type":        "field",
 			"network":     "tcp,udp",
@@ -1120,7 +1370,21 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 		})
 
 	case "whitelist":
-		// Only matching apps or domains pass through proxy; rest is direct
+		if len(blockDomains) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"domain":      blockDomains,
+				"outboundTag": "block",
+			})
+		}
+		if len(blockIPs) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"ip":          blockIPs,
+				"outboundTag": "block",
+			})
+		}
+
 		if len(proxyApps) > 0 {
 			rules = append(rules, v2go.M{
 				"type":        "field",
@@ -1135,7 +1399,15 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 				"outboundTag": "proxy",
 			})
 		}
-		// Catch-all: everything else bypasses proxy (direct)
+		if len(proxyIPs) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"ip":          proxyIPs,
+				"outboundTag": "proxy",
+			})
+		}
+
+		// Whitelist catch-all: everything else is Direct
 		rules = append(rules, v2go.M{
 			"type":        "field",
 			"network":     "tcp,udp",
@@ -1145,7 +1417,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 	case "blacklist":
 		fallthrough
 	default:
-		// Blacklisted apps and domains bypass proxy (direct)
+		// 1. Blacklisted Apps go Direct (before QUIC block, so direct apps never have UDP blocked)
 		if len(directApps) > 0 {
 			rules = append(rules, v2go.M{
 				"type":        "field",
@@ -1153,6 +1425,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 				"outboundTag": "direct",
 			})
 		}
+		// 2. Blacklisted Domains go Direct
 		if len(directDomains) > 0 {
 			rules = append(rules, v2go.M{
 				"type":        "field",
@@ -1160,7 +1433,40 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 				"outboundTag": "direct",
 			})
 		}
-		// Gaming mode: prioritize UDP traffic on fast path
+		// 3. Blacklisted IPs go Direct
+		if len(directIPs) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"ip":          directIPs,
+				"outboundTag": "direct",
+			})
+		}
+
+		// 4. Blocked Domains / IPs (if any)
+		if len(blockDomains) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"domain":      blockDomains,
+				"outboundTag": "block",
+			})
+		}
+		if len(blockIPs) > 0 {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"ip":          blockIPs,
+				"outboundTag": "block",
+			})
+		}
+
+		// 5. Anti-censorship QUIC filter: block port 443 UDP only for proxied traffic
+		rules = append(rules, v2go.M{
+			"type":        "field",
+			"port":        "443",
+			"network":     "udp",
+			"outboundTag": "block",
+		})
+
+		// 6. Gaming mode: prioritize UDP traffic on fast path
 		if gamingMode {
 			rules = append(rules, v2go.M{
 				"type":        "field",
@@ -1168,7 +1474,8 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 				"outboundTag": "proxy",
 			})
 		}
-		// Catch-all: rest of traffic goes through proxy
+
+		// 7. Catch-all: remaining traffic passes through proxy
 		rules = append(rules, v2go.M{
 			"type":        "field",
 			"network":     "tcp,udp",

@@ -195,6 +195,7 @@ type ConnectionStatus struct {
 	GamingMode     bool       `json:"gaming_mode"`
 	ShareLAN       bool       `json:"share_lan"`
 	IsAdmin        bool       `json:"is_admin"`
+	SniSpoofMode   bool       `json:"sni_spoof_mode"`
 	Error          string     `json:"error,omitempty"`
 }
 
@@ -229,4 +230,13 @@ type Settings struct {
 	ProxyApps     string `json:"proxy_apps"`     // App executables to force through proxy (e.g. telegram.exe, discord.exe)
 	BlockDomains  string `json:"block_domains"`  // Domains to block (e.g. ads)
 	UpdateRepo    string `json:"update_repo"`    // GitHub repository for auto-updates (e.g. "N0pperabo/conective")
+
+	// SNI Spoofing Settings (DPI bypass via fake ClientHello injection)
+	SniSpoofEnabled     bool   `json:"sni_spoof_enabled"`
+	SniSpoofEngine      string `json:"sni_spoof_engine"`       // "auto", "binary", "rust", "python"
+	SniSpoofListenHost  string `json:"sni_spoof_listen_host"`  // default: "127.0.0.1"
+	SniSpoofListenPort  int    `json:"sni_spoof_listen_port"`  // default: 40443
+	SniSpoofConnectIP   string `json:"sni_spoof_connect_ip"`   // default: "" (auto-resolve)
+	SniSpoofConnectPort int    `json:"sni_spoof_connect_port"` // default: 443
+	SniSpoofFakeSNI     string `json:"sni_spoof_fake_sni"`     // default: "auth.vercel.com"
 }
