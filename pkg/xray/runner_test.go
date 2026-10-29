@@ -140,8 +140,9 @@ func TestPsiphonTunConfigValidity(t *testing.T) {
 		},
 		"dns": v2go.M{
 			"servers": []string{
-				"1.1.1.1",
-				"8.8.8.8",
+				"https://1.1.1.1/dns-query",
+				"https://8.8.8.8/dns-query",
+				"tcp://1.1.1.1:53",
 			},
 		},
 		"inbounds": []v2go.M{
@@ -173,6 +174,10 @@ func TestPsiphonTunConfigValidity(t *testing.T) {
 				},
 			},
 			{
+				"tag":      "dns-out",
+				"protocol": "dns",
+			},
+			{
 				"tag":      "direct",
 				"protocol": "freedom",
 			},
@@ -183,7 +188,7 @@ func TestPsiphonTunConfigValidity(t *testing.T) {
 		},
 		"routing": v2go.M{
 			"domainStrategy": "IPIfNonMatch",
-			"rules":          r.buildRoutingRules(),
+			"rules":          r.buildPsiphonRoutingRules(),
 		},
 	}
 
@@ -198,6 +203,16 @@ func TestPsiphonTunConfigValidity(t *testing.T) {
 	}
 	if cfg == nil {
 		t.Fatal("expected non-nil parsed config")
+	}
+
+	// Verify that Psiphon routing rules NEVER forward UDP to proxy outbound (prevents 0x03 UDP ASSOCIATE rejection)
+	for idx, rule := range r.buildPsiphonRoutingRules() {
+		if rule["outboundTag"] == "proxy" {
+			netStr, ok := rule["network"].(string)
+			if ok && strings.Contains(netStr, "udp") {
+				t.Fatalf("rule #%d unexpectedly routes UDP to proxy outbound: %+v", idx, rule)
+			}
+		}
 	}
 }
 

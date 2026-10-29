@@ -350,7 +350,6 @@ func (r *Runner) Connect(node *models.Config) error {
 						"https://1.1.1.1/dns-query",
 						"https://8.8.8.8/dns-query",
 						"tcp://1.1.1.1:53",
-						"1.1.1.1",
 					},
 				},
 				"inbounds": []v2go.M{
@@ -381,6 +380,10 @@ func (r *Runner) Connect(node *models.Config) error {
 							},
 						},
 					},
+					{
+						"tag":      "dns-out",
+						"protocol": "dns",
+					},
 					directOutbound,
 					{
 						"tag":      "block",
@@ -389,7 +392,7 @@ func (r *Runner) Connect(node *models.Config) error {
 				},
 				"routing": v2go.M{
 					"domainStrategy": "IPIfNonMatch",
-					"rules":          r.buildRoutingRules(),
+					"rules":          r.buildPsiphonRoutingRules(),
 				},
 			}
 
@@ -732,30 +735,46 @@ func (r *Runner) Connect(node *models.Config) error {
 		directOutbound["streamSettings"] = v2go.M{"sockopt": v2go.M{"interface": physIface}}
 	}
 
+	isSocksUpstream := (node.Protocol == "socks" || node.Protocol == "socks5" || node.Protocol == "http")
+	outboundsList := []v2go.M{
+		outbound,
+	}
+	if isSocksUpstream {
+		outboundsList = append(outboundsList, v2go.M{
+			"tag":      "dns-out",
+			"protocol": "dns",
+		})
+	}
+	outboundsList = append(outboundsList, fragmentOutbound, directOutbound, v2go.M{
+		"tag":      "block",
+		"protocol": "blackhole",
+	})
+
+	dnsServers := []string{
+		"1.1.1.1",
+		"8.8.8.8",
+	}
+	if isSocksUpstream {
+		dnsServers = []string{
+			"https://1.1.1.1/dns-query",
+			"https://8.8.8.8/dns-query",
+			"tcp://1.1.1.1:53",
+		}
+	}
+
 	// Build complete client config with SOCKS, HTTP, and optional TUN inbounds
 	configMap := v2go.M{
 		"log": v2go.M{
 			"loglevel": "warning",
 		},
 		"dns": v2go.M{
-			"servers": []string{
-				"1.1.1.1",
-				"8.8.8.8",
-			},
+			"servers": dnsServers,
 		},
 		"inbounds": inbounds,
-		"outbounds": []v2go.M{
-			outbound,
-			fragmentOutbound,
-			directOutbound,
-			{
-				"tag":      "block",
-				"protocol": "blackhole",
-			},
-		},
+		"outbounds": outboundsList,
 		"routing": v2go.M{
 			"domainStrategy": "IPIfNonMatch",
-			"rules":          r.buildRoutingRules(),
+			"rules":          r.buildRoutingRulesForUpstream(isSocksUpstream),
 		},
 	}
 
@@ -1258,6 +1277,14 @@ func cleanProcessRules(text string) []string {
 }
 
 func (r *Runner) buildRoutingRules() []v2go.M {
+	return r.buildRoutingRulesForUpstream(false)
+}
+
+func (r *Runner) buildPsiphonRoutingRules() []v2go.M {
+	return r.buildRoutingRulesForUpstream(true)
+}
+
+func (r *Runner) buildRoutingRulesForUpstream(isSocksUpstream bool) []v2go.M {
 	gamingMode := r.gamingMode
 	if r.db != nil && !gamingMode {
 		gamingMode = r.db.GetSetting("gaming_mode", "false") == "true"
@@ -1283,12 +1310,37 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 		},
 	}
 
-	if r.db == nil {
+	if isSocksUpstream {
+		// Route DNS (port 53) to Xray's internal DNS handler so SOCKS upstream is never hit with UDP ASSOCIATE (0x03)
 		rules = append(rules, v2go.M{
 			"type":        "field",
+			"port":        "53",
 			"network":     "tcp,udp",
-			"outboundTag": "proxy",
+			"outboundTag": "dns-out",
 		})
+	}
+
+	if r.db == nil {
+		if isSocksUpstream {
+			rules = append(rules,
+				v2go.M{
+					"type":        "field",
+					"network":     "tcp",
+					"outboundTag": "proxy",
+				},
+				v2go.M{
+					"type":        "field",
+					"network":     "udp",
+					"outboundTag": "direct",
+				},
+			)
+		} else {
+			rules = append(rules, v2go.M{
+				"type":        "field",
+				"network":     "tcp,udp",
+				"outboundTag": "proxy",
+			})
+		}
 		return rules
 	}
 
@@ -1355,19 +1407,34 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 			"outboundTag": "block",
 		})
 
-		if gamingMode {
+		if isSocksUpstream {
+			rules = append(rules,
+				v2go.M{
+					"type":        "field",
+					"network":     "tcp",
+					"outboundTag": "proxy",
+				},
+				v2go.M{
+					"type":        "field",
+					"network":     "udp",
+					"outboundTag": "direct",
+				},
+			)
+		} else {
+			if gamingMode {
+				rules = append(rules, v2go.M{
+					"type":        "field",
+					"network":     "udp",
+					"outboundTag": "proxy",
+				})
+			}
+
 			rules = append(rules, v2go.M{
 				"type":        "field",
-				"network":     "udp",
+				"network":     "tcp,udp",
 				"outboundTag": "proxy",
 			})
 		}
-
-		rules = append(rules, v2go.M{
-			"type":        "field",
-			"network":     "tcp,udp",
-			"outboundTag": "proxy",
-		})
 
 	case "whitelist":
 		if len(blockDomains) > 0 {
@@ -1385,10 +1452,16 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 			})
 		}
 
+		networkFilter := "tcp,udp"
+		if isSocksUpstream {
+			networkFilter = "tcp"
+		}
+
 		if len(proxyApps) > 0 {
 			rules = append(rules, v2go.M{
 				"type":        "field",
 				"process":     proxyApps,
+				"network":     networkFilter,
 				"outboundTag": "proxy",
 			})
 		}
@@ -1396,6 +1469,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 			rules = append(rules, v2go.M{
 				"type":        "field",
 				"domain":      proxyDomains,
+				"network":     networkFilter,
 				"outboundTag": "proxy",
 			})
 		}
@@ -1403,6 +1477,7 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 			rules = append(rules, v2go.M{
 				"type":        "field",
 				"ip":          proxyIPs,
+				"network":     networkFilter,
 				"outboundTag": "proxy",
 			})
 		}
@@ -1466,21 +1541,38 @@ func (r *Runner) buildRoutingRules() []v2go.M {
 			"outboundTag": "block",
 		})
 
-		// 6. Gaming mode: prioritize UDP traffic on fast path
-		if gamingMode {
+		if isSocksUpstream {
+			// SOCKS upstream only supports TCP (cmd 0x01).
+			// Route TCP to proxy, and non-DNS UDP to direct to prevent "command was 0x03, not 0x01" aborts.
+			rules = append(rules,
+				v2go.M{
+					"type":        "field",
+					"network":     "tcp",
+					"outboundTag": "proxy",
+				},
+				v2go.M{
+					"type":        "field",
+					"network":     "udp",
+					"outboundTag": "direct",
+				},
+			)
+		} else {
+			// 6. Gaming mode: prioritize UDP traffic on fast path
+			if gamingMode {
+				rules = append(rules, v2go.M{
+					"type":        "field",
+					"network":     "udp",
+					"outboundTag": "proxy",
+				})
+			}
+
+			// 7. Catch-all: remaining traffic passes through proxy
 			rules = append(rules, v2go.M{
 				"type":        "field",
-				"network":     "udp",
+				"network":     "tcp,udp",
 				"outboundTag": "proxy",
 			})
 		}
-
-		// 7. Catch-all: remaining traffic passes through proxy
-		rules = append(rules, v2go.M{
-			"type":        "field",
-			"network":     "tcp,udp",
-			"outboundTag": "proxy",
-		})
 	}
 
 	return rules
